@@ -1,0 +1,30 @@
+{
+  "productName": "Strudel WAV Exporter",
+  "version": "0.1.0",
+  "identifier": "com.strudel.wav-exporter",
+  "build": {
+    "frontendDist": "../dist",
+    "devUrl": "http://localhost:5173",
+    "beforeDevCommand": "pnpm dev",
+    "beforeBuildCommand": "pnpm build"
+  },
+  "bundle": {
+    "active": true,
+    "targets": "all",
+    "icon": ["icons/icon.png"]
+  },
+  "app": {
+    "windows": [
+      {
+        "title": "Strudel WAV Exporter",
+        "width": 860,
+        "height": 640,
+        "resizable": false,
+        "center": true
+      }
+    ],
+    "security": {
+      "csp": null
+    }
+  }
+}
