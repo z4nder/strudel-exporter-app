@@ -3,9 +3,13 @@ import { evalScope } from '@strudel/core'
 import * as strudelCore from '@strudel/core'
 import * as strudelMini from '@strudel/mini'
 import * as strudelWebaudio from '@strudel/webaudio'
+import type { StrudelMeta } from './loop-parser'
 
 let initialized = false
 let _repl: ReturnType<typeof webaudioRepl> | null = null
+let cachedComposition: { code: string; pattern: any; meta: StrudelMeta } | null = null
+
+export type RenderProgress = (progress: number, label: string) => void
 
 async function ensureInit() {
   if (initialized) return
@@ -148,14 +152,91 @@ async function evalPattern(code: string): Promise<any> {
   return pattern
 }
 
+function stableValue(value: unknown, seen = new WeakSet<object>()): unknown {
+  if (value === null || typeof value === 'string' || typeof value === 'boolean') return value
+  if (typeof value === 'number') return Number.isFinite(value) ? value : String(value)
+  if (typeof value === 'bigint') return value.toString()
+  if (typeof value === 'undefined' || typeof value === 'function' || typeof value === 'symbol') return undefined
+  if (Array.isArray(value)) return value.map((item) => stableValue(item, seen))
+  if (typeof value === 'object') {
+    if (seen.has(value)) return '[circular]'
+    seen.add(value)
+    const normalized: Record<string, unknown> = {}
+    for (const key of Object.keys(value).sort()) {
+      const item = stableValue((value as Record<string, unknown>)[key], seen)
+      if (item !== undefined) normalized[key] = item
+    }
+    seen.delete(value)
+    return normalized
+  }
+  return String(value)
+}
+
+function cycleSignature(pattern: any, cycle: number, cps: number): string {
+  const round = (value: number) => Math.round(value * 1_000_000_000) / 1_000_000_000
+  const events = pattern
+    .queryArc(cycle, cycle + 1, { _cps: cps })
+    .filter((event: any) => event.hasOnset())
+    .map((event: any) => ({
+      begin: round(event.whole.begin.valueOf() - cycle),
+      duration: round(event.duration.valueOf()),
+      value: stableValue(event.value),
+    }))
+
+  return JSON.stringify(events)
+}
+
+function detectLoopCycles(pattern: any, cps: number, maxPeriod = 32, repetitions = 3): number {
+  const signatures = Array.from(
+    { length: maxPeriod * repetitions },
+    (_, cycle) => cycleSignature(pattern, cycle, cps),
+  )
+
+  for (let period = 1; period <= maxPeriod; period++) {
+    let repeats = true
+    for (let repetition = 1; repetition < repetitions && repeats; repetition++) {
+      for (let offset = 0; offset < period; offset++) {
+        if (signatures[offset] !== signatures[repetition * period + offset]) {
+          repeats = false
+          break
+        }
+      }
+    }
+    if (repeats) return period
+  }
+
+  console.warn(`[strudel] no stable loop found within ${maxPeriod} cycles; falling back to 1 cycle`)
+  return 1
+}
+
+async function evaluateComposition(code: string): Promise<{ pattern: any; meta: StrudelMeta }> {
+  if (cachedComposition?.code === code) return cachedComposition
+
+  await ensureInit()
+  const pattern = await evalPattern(code)
+  const schedulerCps = Number((_repl?.scheduler as any)?.cps)
+  const cps = Number.isFinite(schedulerCps) && schedulerCps > 0 ? schedulerCps : 0.5
+  const minLoopCycles = detectLoopCycles(pattern, cps)
+  const meta = { cps, cycleDuration: 1 / cps, minLoopCycles }
+  cachedComposition = { code, pattern, meta }
+  console.log('[strudel] composition analyzed:', JSON.stringify(meta))
+  return cachedComposition
+}
+
+export async function analyzeStrudel(code: string): Promise<StrudelMeta> {
+  const { meta } = await evaluateComposition(code)
+  return meta
+}
+
 export async function renderToUrl(
   code: string,
-  cps: number,
   loops: number,
+  onProgress?: RenderProgress,
 ): Promise<string> {
-  console.log('[strudel] renderToUrl start — cps:', cps, 'loops:', loops)
-  const blob = await renderToWavBlob(code, cps, loops)
+  console.log('[strudel] renderToUrl start — loops:', loops)
+  const blob = await renderToWavBlob(code, loops, onProgress)
   const url = URL.createObjectURL(blob)
+  onProgress?.(1, 'Preview pronto')
   console.log('[strudel] preview URL created — bytes:', blob.size)
   return url
 }
@@ -163,40 +244,49 @@ export async function renderToUrl(
 /** Uses Strudel for evaluation, event scheduling, samples, effects and rendering. */
 async function renderToWavBlob(
   code: string,
-  cps: number,
   loops: number,
+  onProgress?: RenderProgress,
 ): Promise<Blob> {
-  await ensureInit()
-  const pattern = await evalPattern(code)
-  console.log('[strudel] got pattern, rendering official Strudel events (begin=0, end=', loops, ')')
+  onProgress?.(0.03, 'Analisando composição…')
+  const { pattern, meta } = await evaluateComposition(code)
+  const endCycle = meta.minLoopCycles * loops
+  onProgress?.(0.1, `Preparando ${endCycle} cycles…`)
+  console.log('[strudel] got pattern, rendering official Strudel events (begin=0, end=', endCycle, ')')
 
   const sampleRate = 44100
   const previousContext = strudelWebaudio.getAudioContext()
   await previousContext.close()
-  const offlineContext = new OfflineAudioContext(2, (loops / cps) * sampleRate, sampleRate)
+  const offlineContext = new OfflineAudioContext(2, (endCycle / meta.cps) * sampleRate, sampleRate)
   strudelWebaudio.setAudioContext(offlineContext)
   strudelWebaudio.setSuperdoughAudioController(null)
 
   try {
     await strudelWebaudio.initAudio({ maxPolyphony: 32, multiChannelOrbits: false })
     const events = pattern
-      .queryArc(0, loops, { _cps: cps })
+      .queryArc(0, endCycle, { _cps: meta.cps })
       .sort((a: any, b: any) => a.whole.begin.valueOf() - b.whole.begin.valueOf())
 
     const onsets = events.filter((event: any) => event.hasOnset())
     console.log('[strudel] scheduling onsets:', onsets.length)
-    for (const event of onsets) {
+    for (let index = 0; index < onsets.length; index++) {
+      const event = onsets[index]
       event.ensureObjectValue()
       await strudelWebaudio.superdough(
         event.value,
-        event.whole.begin.valueOf() / cps,
-        event.duration / cps,
-        cps,
-        event.whole.begin.valueOf() / cps,
+        event.whole.begin.valueOf() / meta.cps,
+        event.duration / meta.cps,
+        meta.cps,
+        event.whole.begin.valueOf() / meta.cps,
+      )
+      onProgress?.(
+        0.12 + (0.68 * (index + 1)) / Math.max(onsets.length, 1),
+        `Preparando sons ${index + 1}/${onsets.length}…`,
       )
     }
 
+    onProgress?.(0.84, 'Renderizando áudio…')
     const renderedBuffer = await offlineContext.startRendering()
+    onProgress?.(0.94, 'Codificando WAV…')
     const wavBytes = audioBufferToWav(renderedBuffer)
     const wavBlob = new Blob([wavBytes], { type: 'audio/wav' })
     console.log('[strudel] offline render done — bytes:', wavBlob.size)
@@ -249,15 +339,17 @@ function audioBufferToWav(buffer: AudioBuffer): ArrayBuffer {
 
 export async function exportToWav(
   code: string,
-  cps: number,
   loops: number,
   name: string,
+  onProgress?: RenderProgress,
 ): Promise<void> {
   console.log('[strudel] exportToWav start — loops:', loops, 'name:', name)
-  const blob = await renderToWavBlob(code, cps, loops)
+  const blob = await renderToWavBlob(code, loops, onProgress)
   const { save } = await import('@tauri-apps/plugin-dialog')
+  const fileName = name.toLowerCase().endsWith('.wav') ? name : `${name}.wav`
+  onProgress?.(0.96, 'Escolhendo destino…')
   const path = await save({
-    defaultPath: `${name}.wav`,
+    defaultPath: fileName,
     filters: [{ name: 'WAV audio', extensions: ['wav'] }],
   })
 
@@ -267,8 +359,10 @@ export async function exportToWav(
   }
 
   const bytes = Array.from(new Uint8Array(await blob.arrayBuffer()))
+  onProgress?.(0.98, 'Salvando arquivo…')
   console.log('[strudel] saving WAV through Tauri — path:', path, 'bytes:', bytes.length)
   const { invoke } = await import('@tauri-apps/api/core')
   await invoke('save_wav_bytes', { path, bytes })
+  onProgress?.(1, 'Exportação concluída')
   console.log('[strudel] export done — path:', path)
 }

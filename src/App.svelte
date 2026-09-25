@@ -1,9 +1,9 @@
 <script lang="ts">
   import { open } from '@tauri-apps/plugin-dialog'
-  import { parseStrudelMeta, calcDuration, formatDuration } from './lib/loop-parser'
-  import { renderToUrl, exportToWav } from './lib/strudel-runner'
+  import { calcDuration, formatDuration, type StrudelMeta } from './lib/loop-parser'
+  import { analyzeStrudel, renderToUrl, exportToWav } from './lib/strudel-runner'
 
-  type AppStatus = 'idle' | 'rendering_preview' | 'rendering_export' | 'error'
+  type AppStatus = 'idle' | 'analyzing' | 'rendering_preview' | 'rendering_export' | 'error'
 
   let filePath = $state('')
   let fileContent = $state('')
@@ -12,6 +12,9 @@
   let appStatus = $state<AppStatus>('idle')
   let errorMsg = $state('')
   let isDragging = $state(false)
+  let meta = $state<StrudelMeta | null>(null)
+  let renderProgress = $state(0)
+  let progressLabel = $state('')
 
   // preview
   let previewUrl = $state('')
@@ -19,13 +22,10 @@
   let audioPlaying = $state(false)
   let audioTime = $state(0)
   let audioDuration = $state(0)
-  let previewLoops = $state(1) // preview always renders 1 loop fast
-
   let hasFile = $derived(fileContent.length > 0)
-  let meta = $derived(hasFile ? parseStrudelMeta(fileContent) : null)
   let duration = $derived(meta ? calcDuration(meta, loops) : 0)
-  let previewDuration = $derived(meta ? calcDuration(meta, previewLoops) : 0)
-  let isBusy = $derived(appStatus === 'rendering_preview' || appStatus === 'rendering_export')
+  let isBusy = $derived(appStatus === 'analyzing' || appStatus === 'rendering_preview' || appStatus === 'rendering_export')
+  let isRendering = $derived(appStatus === 'rendering_preview' || appStatus === 'rendering_export')
   let hasPreview = $derived(previewUrl.length > 0)
 
   async function pickFile() {
@@ -39,16 +39,19 @@
   async function loadFile(path: string) {
     try {
       filePath = path
-      const name = path.split('/').pop() ?? path
-      trackName = name.replace(/\.\w+$/, '')
+      const name = path.split(/[/\\]/).pop() ?? path
+      trackName = name.replace(/\.(strudel|js)$/i, '')
       const { invoke } = await import('@tauri-apps/api/core')
+      meta = null
       fileContent = await invoke<string>('read_strudel_file', { path })
+      appStatus = 'analyzing'
+      meta = await analyzeStrudel(fileContent)
       appStatus = 'idle'
       errorMsg = ''
       clearPreview()
     } catch (err) {
       appStatus = 'error'
-      errorMsg = `Erro ao ler arquivo: ${err}`
+      errorMsg = `Erro ao importar arquivo: ${err}`
     }
   }
 
@@ -85,16 +88,30 @@
     fileContent = ''
     trackName = 'track'
     loops = 1
+    meta = null
     appStatus = 'idle'
     errorMsg = ''
+    renderProgress = 0
+    progressLabel = ''
+  }
+
+  function updateProgress(progress: number, label: string) {
+    renderProgress = Math.max(0, Math.min(1, progress))
+    progressLabel = label
+  }
+
+  function normalizeLoops() {
+    loops = Math.min(999, Math.max(1, Math.round(Number(loops) || 1)))
   }
 
   async function generatePreview() {
     if (!meta || !fileContent || isBusy) return
     clearPreview()
+    renderProgress = 0
+    progressLabel = 'Iniciando preview…'
     appStatus = 'rendering_preview'
     try {
-      const url = await renderToUrl(fileContent, meta.cps, previewLoops)
+      const url = await renderToUrl(fileContent, loops, updateProgress)
       previewUrl = url
       appStatus = 'idle'
     } catch (err) {
@@ -105,11 +122,13 @@
 
   async function doExport() {
     if (!meta || !fileContent || isBusy) return
-    // Stop preview playback before export (renderPatternAudio closes AudioContext)
+    // Stop preview playback before creating a new offline AudioContext.
     if (audioEl) audioEl.pause()
+    renderProgress = 0
+    progressLabel = 'Iniciando exportação…'
     appStatus = 'rendering_export'
     try {
-      await exportToWav(fileContent, meta.cps, loops, trackName)
+      await exportToWav(fileContent, loops, trackName, updateProgress)
       appStatus = 'idle'
     } catch (err) {
       appStatus = 'error'
@@ -216,6 +235,11 @@
             <span class="meta-val">{meta.cycleDuration.toFixed(2)}s</span>
             <span class="meta-label">/ cycle</span>
           </div>
+          <div class="meta-sep">·</div>
+          <div class="meta-chip">
+            <span class="meta-val">{meta.minLoopCycles}</span>
+            <span class="meta-label">cycles / loop</span>
+          </div>
         </div>
       {/if}
     </div>
@@ -230,8 +254,8 @@
       <div class="duration-display">
         Exportar: <strong>{formatDuration(duration)}</strong>
         <span class="duration-sep">·</span>
-        Preview: <strong>{formatDuration(previewDuration)}</strong>
-        <span class="loops-hint">(1 loop)</span>
+        Preview: <strong>{formatDuration(duration)}</strong>
+        <span class="loops-hint">({loops} {loops === 1 ? 'loop' : 'loops'})</span>
       </div>
 
       <div class="action-row">

@@ -1,22 +1,28 @@
-# Teste ponta a ponta do export WAV
+# Testes de feature do export WAV
 
-O teste usa `source/forest.strudel` e percorre o mesmo fluxo da interface:
+Os testes usam `source/forest.strudel` e chamam diretamente as funções usadas
+pela aplicação, sem montar `App.svelte` e sem depender da interface.
 
-1. clica na área de importação;
-2. o mock oficial do IPC Tauri seleciona `source/forest.strudel`;
-3. a aplicação chama `read_strudel_file` e atualiza a UI;
-4. o teste clica em **Exportar WAV**;
-5. o Strudel avalia o código e renderiza seus eventos em um `OfflineAudioContext`;
-6. a aplicação abre o diálogo de destino e chama `save_wav_bytes`;
-7. o teste valida o WAV salvo.
+O cenário verifica em sequência:
 
-Somente as fronteiras nativas (diálogo, leitura e gravação) são simuladas. Os
-cliques, o estado Svelte, o código de produção e a renderização Strudel são reais.
+- `analyzeStrudel()` identifica `0.5 cps` e o período completo de 8 cycles;
+- `renderToUrl()` transforma um loop completo em uma URL de preview WAV válida;
+- `exportToWav()` transforma um loop completo e envia os bytes WAV ao comando Tauri.
+
+O período é descoberto comparando os eventos gerados pelo próprio `Pattern` do
+Strudel em cycles sucessivos. O teste não interpreta o texto de `arrange()`.
+
+O Chromium headless é usado somente como runtime para `OfflineAudioContext`,
+`AudioBuffer` e as demais APIs Web Audio. Não há interação com botões, textos,
+HTML da aplicação ou estado de componentes Svelte.
+
+Somente as fronteiras nativas do segundo caso — diálogo e escrita Tauri — são
+simuladas. Avaliação, samples, synths, efeitos e renderização Strudel são reais.
 
 ## Executar
 
 ```bash
-pnpm test:e2e
+pnpm test:feature
 ```
 
 O teste requer internet porque `forest.strudel` e os bancos padrão carregam
@@ -34,11 +40,13 @@ O log é acumulativo para permitir acompanhar as iterações do ciclo TDD.
 
 O teste falha se qualquer uma destas condições não for atendida:
 
-- a UI não importar `forest.strudel`;
-- o CPS exibido não for `0.5`;
+- a fixture `forest.strudel` não puder ser carregada;
+- o período mínimo detectado não for 8 cycles;
+- 10 loops não corresponderem a 160 segundos em `0.5 cps`;
+- qualquer uma das funções de preview/export falhar;
 - o backend nativo não receber uma chamada de gravação;
 - o arquivo não tiver cabeçalhos `RIFF`, `WAVE`, `fmt ` e `data`;
 - o WAV não for PCM estéreo em 44.1 kHz;
-- a duração não estiver próxima de dois segundos para um cycle em `0.5 cps`;
+- a duração de um loop completo não estiver próxima de 16 segundos;
 - o áudio estiver silencioso;
 - o motor Web Audio reportar sample ausente ou nós de contextos diferentes.
