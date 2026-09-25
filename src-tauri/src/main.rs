@@ -1,7 +1,5 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
-mod wav;
-
 use tauri::command;
 
 #[command]
@@ -10,14 +8,19 @@ fn read_strudel_file(path: String) -> Result<String, String> {
 }
 
 #[command]
-async fn save_wav(samples: Vec<f32>, sample_rate: u32, path: String) -> Result<(), String> {
-    let encoded = wav::encode_wav(&samples, sample_rate, 2);
+async fn save_wav_bytes(bytes: Vec<u8>, path: String) -> Result<(), String> {
+    if bytes.len() < 44 || &bytes[0..4] != b"RIFF" || &bytes[8..12] != b"WAVE" {
+        return Err("dados recebidos não são um arquivo WAV válido".to_string());
+    }
+
     let final_path = if path.to_lowercase().ends_with(".wav") {
         path
     } else {
         format!("{}.wav", path)
     };
-    std::fs::write(&final_path, encoded).map_err(|e| e.to_string())
+
+    log::info!("saving Strudel WAV: path={} bytes={}", final_path, bytes.len());
+    std::fs::write(&final_path, bytes).map_err(|e| e.to_string())
 }
 
 fn main() {
@@ -34,7 +37,7 @@ fn main() {
                 .build(),
         )
         .plugin(tauri_plugin_dialog::init())
-        .invoke_handler(tauri::generate_handler![read_strudel_file, save_wav])
+        .invoke_handler(tauri::generate_handler![read_strudel_file, save_wav_bytes])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
 }

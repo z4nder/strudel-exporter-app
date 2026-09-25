@@ -1,5 +1,8 @@
 # Strudel WAV Exporter — Plano de Implementação (Tauri)
 
+> Documento histórico do planejamento inicial. O fluxo implementado e seu teste
+> ponta a ponta estão descritos em `docs/testing-wav-export.md`.
+
 ## Stack
 
 - **Backend:** Rust (Tauri) — leitura de arquivo, encoding WAV, lógica do app

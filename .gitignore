@@ -6,6 +6,9 @@
 node_modules
 dist
 .svelte-kit
+test-results
+playwright-report
+logs/*.log
 
 # Nix/direnv
 .direnv
