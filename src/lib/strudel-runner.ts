@@ -8,6 +8,7 @@ import type { StrudelMeta } from './loop-parser'
 let initialized = false
 let _repl: ReturnType<typeof webaudioRepl> | null = null
 let cachedComposition: { code: string; pattern: any; meta: StrudelMeta } | null = null
+let cachedBaseWav: { code: string; blob: Blob } | null = null
 
 export type RenderProgress = (progress: number, label: string) => void
 
@@ -239,7 +240,7 @@ export async function renderToUrl(
   signal?: AbortSignal,
 ): Promise<string> {
   console.log('[strudel] renderToUrl start — loops:', loops)
-  const blob = await renderToWavBlob(code, loops, onProgress, signal)
+  const blob = await renderBaseLoopToWavBlob(code, onProgress, signal)
   throwIfAborted(signal)
   const url = URL.createObjectURL(blob)
   onProgress?.(1, 'Preview pronto')
@@ -248,18 +249,22 @@ export async function renderToUrl(
 }
 
 /** Uses Strudel for evaluation, event scheduling, samples, effects and rendering. */
-async function renderToWavBlob(
+async function renderBaseLoopToWavBlob(
   code: string,
-  loops: number,
   onProgress?: RenderProgress,
   signal?: AbortSignal,
 ): Promise<Blob> {
   throwIfAborted(signal)
+  if (cachedBaseWav?.code === code) {
+    onProgress?.(0.94, 'Round completo reutilizado do cache')
+    return cachedBaseWav.blob
+  }
+
   onProgress?.(0.03, 'Analisando composição…')
   const { pattern, meta } = await evaluateComposition(code)
   throwIfAborted(signal)
-  const endCycle = meta.minLoopCycles * loops
-  onProgress?.(0.1, `Preparando ${endCycle} cycles…`)
+  const endCycle = meta.minLoopCycles
+  onProgress?.(0.1, `Preparando 1 round completo (${endCycle} cycles)…`)
   console.log('[strudel] got pattern, rendering official Strudel events (begin=0, end=', endCycle, ')')
 
   const sampleRate = 44100
@@ -301,6 +306,7 @@ async function renderToWavBlob(
     const wavBytes = audioBufferToWav(renderedBuffer)
     throwIfAborted(signal)
     const wavBlob = new Blob([wavBytes], { type: 'audio/wav' })
+    cachedBaseWav = { code, blob: wavBlob }
     console.log('[strudel] offline render done — bytes:', wavBlob.size)
     return wavBlob
   } finally {
@@ -357,7 +363,7 @@ export async function exportToWav(
   signal?: AbortSignal,
 ): Promise<void> {
   console.log('[strudel] exportToWav start — loops:', loops, 'name:', name)
-  const blob = await renderToWavBlob(code, loops, onProgress, signal)
+  const blob = await renderBaseLoopToWavBlob(code, onProgress, signal)
   throwIfAborted(signal)
   const { save } = await import('@tauri-apps/plugin-dialog')
   const fileName = name.toLowerCase().endsWith('.wav') ? name : `${name}.wav`
@@ -374,12 +380,12 @@ export async function exportToWav(
     return
   }
 
-  const bytes = Array.from(new Uint8Array(await blob.arrayBuffer()))
+  const baseBytes = Array.from(new Uint8Array(await blob.arrayBuffer()))
   throwIfAborted(signal)
-  onProgress?.(0.98, 'Salvando arquivo…')
-  console.log('[strudel] saving WAV through Tauri — path:', path, 'bytes:', bytes.length)
+  onProgress?.(0.98, `Gravando ${loops} ${loops === 1 ? 'round' : 'rounds'}…`)
+  console.log('[strudel] saving looped WAV through Tauri — path:', path, 'base bytes:', baseBytes.length, 'loops:', loops)
   const { invoke } = await import('@tauri-apps/api/core')
-  await invoke('save_wav_bytes', { path, bytes })
+  await invoke('save_looped_wav', { path, baseBytes, loops })
   throwIfAborted(signal)
   onProgress?.(1, 'Exportação concluída')
   console.log('[strudel] export done — path:', path)

@@ -29,9 +29,18 @@ let saveCalls = 0
 mockIPC(async (command, payload) => {
   if (command === 'plugin:dialog|save') return '/tmp/forest.wav'
 
-  if (command === 'save_wav_bytes') {
-    const bytes = (payload?.bytes ?? []) as number[]
-    savedBytes = new Uint8Array(bytes)
+  if (command === 'save_looped_wav') {
+    const base = new Uint8Array((payload?.baseBytes ?? []) as number[])
+    const loops = Number(payload?.loops ?? 1)
+    const dataSize = new DataView(base.buffer, base.byteOffset, base.byteLength).getUint32(40, true)
+    savedBytes = new Uint8Array(44 + dataSize * loops)
+    savedBytes.set(base.subarray(0, 44))
+    const outputView = new DataView(savedBytes.buffer)
+    outputView.setUint32(4, 36 + dataSize * loops, true)
+    outputView.setUint32(40, dataSize * loops, true)
+    for (let loop = 0; loop < loops; loop++) {
+      savedBytes.set(base.subarray(44, 44 + dataSize), 44 + loop * dataSize)
+    }
     saveCalls += 1
     return null
   }

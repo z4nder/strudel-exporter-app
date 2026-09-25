@@ -6,8 +6,14 @@ pela aplicação, sem montar `App.svelte` e sem depender da interface.
 O cenário verifica em sequência:
 
 - `analyzeStrudel()` identifica `0.5 cps` e o período completo de 8 cycles;
-- `renderToUrl()` transforma um loop completo em uma URL de preview WAV válida;
-- `exportToWav()` transforma um loop completo e envia os bytes WAV ao comando Tauri.
+- `renderToUrl()` transforma um round completo em uma URL de preview WAV válida;
+- `exportToWav()` reutiliza esse WAV-base e envia ao Rust a base e a quantidade de loops.
+
+O Strudel nunca renderiza novamente a composição inteira para cada repetição.
+Ele sintetiza somente `minLoopCycles` uma vez e mantém esse WAV-base em cache.
+O player repete a base durante o preview; no export, o Rust grava o bloco PCM
+sequencialmente e atualiza os tamanhos `RIFF` e `data`, sem FFmpeg e sem
+recompressão.
 
 O período é descoberto comparando os eventos gerados pelo próprio `Pattern` do
 Strudel em cycles sucessivos. O teste não interpreta o texto de `arrange()`.
@@ -23,6 +29,7 @@ simuladas. Avaliação, samples, synths, efeitos e renderização Strudel são r
 
 ```bash
 pnpm test:feature
+cargo test --manifest-path src-tauri/Cargo.toml
 ```
 
 O teste requer internet porque `forest.strudel` e os bancos padrão carregam
@@ -50,3 +57,7 @@ O teste falha se qualquer uma destas condições não for atendida:
 - a duração de um loop completo não estiver próxima de 16 segundos;
 - o áudio estiver silencioso;
 - o motor Web Audio reportar sample ausente ou nós de contextos diferentes.
+
+Os testes Rust também falham se a repetição não preservar exatamente o PCM,
+se o cabeçalho final tiver tamanhos incorretos ou se loops fora de `1..=999`
+forem aceitos.

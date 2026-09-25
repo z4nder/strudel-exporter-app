@@ -24,6 +24,9 @@
   let audioPlaying = $state(false)
   let audioTime = $state(0)
   let audioDuration = $state(0)
+  let baseAudioDuration = $state(0)
+  let previewIteration = $state(0)
+  let previewLoops = $state(1)
   let hasFile = $derived(fileContent.length > 0)
   let duration = $derived(meta ? calcDuration(meta, loops) : 0)
   let isBusy = $derived(appStatus === 'analyzing' || appStatus === 'rendering_preview' || appStatus === 'rendering_export')
@@ -82,6 +85,9 @@
     audioPlaying = false
     audioTime = 0
     audioDuration = 0
+    baseAudioDuration = 0
+    previewIteration = 0
+    previewLoops = 1
   }
 
   function reset() {
@@ -107,6 +113,11 @@
 
   function normalizeLoops() {
     loops = Math.min(999, Math.max(1, Math.round(Number(loops) || 1)))
+    if (hasPreview) {
+      previewLoops = loops
+      audioDuration = baseAudioDuration * previewLoops
+      if (previewIteration >= previewLoops) stopAudio()
+    }
   }
 
   function normalizeTrackName() {
@@ -124,6 +135,7 @@
     if (!meta || !fileContent || isBusy) return
     normalizeLoops()
     clearPreview()
+    previewLoops = loops
     renderProgress = 0
     progressLabel = 'Iniciando preview…'
     cancelRequested = false
@@ -194,33 +206,53 @@
 
   // Audio element event handlers
   function onAudioTimeUpdate() {
-    if (audioEl) audioTime = audioEl.currentTime
+    if (audioEl) audioTime = previewIteration * baseAudioDuration + audioEl.currentTime
   }
   function onAudioDuration() {
-    if (audioEl) audioDuration = audioEl.duration
+    if (audioEl && Number.isFinite(audioEl.duration)) {
+      baseAudioDuration = audioEl.duration
+      audioDuration = baseAudioDuration * previewLoops
+    }
   }
   function onAudioPlay() { audioPlaying = true }
   function onAudioPause() { audioPlaying = false }
-  function onAudioEnded() { audioPlaying = false; audioTime = 0 }
+  function onAudioEnded() {
+    if (!audioEl) return
+    if (previewIteration + 1 < previewLoops) {
+      previewIteration += 1
+      audioEl.currentTime = 0
+      void audioEl.play()
+      return
+    }
+    audioPlaying = false
+    previewIteration = 0
+    audioTime = 0
+    audioEl.currentTime = 0
+  }
 
   function togglePlay() {
     if (!audioEl) return
     if (audioPlaying) {
       audioEl.pause()
     } else {
-      audioEl.play()
+      void audioEl.play()
     }
   }
 
   function stopAudio() {
     if (!audioEl) return
     audioEl.pause()
+    previewIteration = 0
     audioEl.currentTime = 0
+    audioTime = 0
   }
 
   function seek(e: Event) {
-    if (!audioEl) return
-    audioEl.currentTime = Number((e.target as HTMLInputElement).value)
+    if (!audioEl || baseAudioDuration <= 0) return
+    const target = Math.min(Number((e.target as HTMLInputElement).value), audioDuration)
+    previewIteration = Math.min(Math.floor(target / baseAudioDuration), previewLoops - 1)
+    audioEl.currentTime = Math.min(target - previewIteration * baseAudioDuration, baseAudioDuration)
+    audioTime = target
   }
 
   function formatTime(s: number): string {
@@ -399,6 +431,7 @@
 
       {#if hasPreview}
         <div class="player">
+          <div class="player-loop-info">1 round renderizado × {previewLoops}</div>
           <div class="player-controls">
             <button class="player-btn" onclick={togglePlay} aria-label={audioPlaying ? 'Pausar' : 'Reproduzir'}>
               {#if audioPlaying}
@@ -673,6 +706,10 @@
     border: 1px solid #1e1e2c;
     border-radius: 10px;
     padding: 12px 16px;
+  }
+  .player-loop-info {
+    margin-bottom: 9px; color: #50506a;
+    font: 11px 'JetBrains Mono', monospace;
   }
   .player-controls {
     display: flex;
