@@ -1,7 +1,9 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 use std::io::{BufWriter, Write};
-use tauri::command;
+use tauri::{command, Manager};
+
+mod library;
 
 #[command]
 fn read_strudel_file(path: String) -> Result<String, String> {
@@ -107,7 +109,23 @@ fn main() {
                 .build(),
         )
         .plugin(tauri_plugin_dialog::init())
-        .invoke_handler(tauri::generate_handler![read_strudel_file, save_looped_wav])
+        .setup(|app| {
+            let db = library::open(app.handle()).map_err(|error| {
+                Box::<dyn std::error::Error>::from(format!(
+                    "failed to open library database: {error}"
+                ))
+            })?;
+            app.manage(db);
+            Ok(())
+        })
+        .invoke_handler(tauri::generate_handler![
+            read_strudel_file,
+            save_looped_wav,
+            library::library_list_tracks,
+            library::library_import_track,
+            library::library_save_track_settings,
+            library::library_delete_track,
+        ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
 }

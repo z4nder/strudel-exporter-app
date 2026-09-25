@@ -4,8 +4,8 @@
   "identifier": "com.strudel.wav-exporter",
   "build": {
     "frontendDist": "../dist",
-    "devUrl": "http://localhost:5173",
-    "beforeDevCommand": "pnpm dev",
+    "devUrl": "http://localhost:5174",
+    "beforeDevCommand": "pnpm dev --port 5174",
     "beforeBuildCommand": "pnpm build"
   },
   "bundle": {

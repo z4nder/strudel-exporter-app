@@ -1,9 +1,33 @@
 <script lang="ts">
+  import { onMount } from 'svelte'
   import { open } from '@tauri-apps/plugin-dialog'
+  import { invoke } from '@tauri-apps/api/core'
   import { formatDuration, type StrudelMeta } from './lib/loop-parser'
   import { analyzeStrudel, renderToUrl, exportToWav, type RenderSettings } from './lib/strudel-runner'
+  import {
+    deleteTrack as deleteLibraryTrack,
+    importTrack as importLibraryTrack,
+    listTracks,
+    saveTrackSettings,
+    type LibraryTrack,
+    type SavedTrackSettings,
+  } from './lib/library'
 
   type AppStatus = 'idle' | 'analyzing' | 'rendering_preview' | 'rendering_export' | 'error'
+  type AppScreen = 'library' | 'track'
+  type HomeTab = 'tracks' | 'albums'
+
+  let screen = $state<AppScreen>('library')
+  let homeTab = $state<HomeTab>('tracks')
+  let tracks = $state<LibraryTrack[]>([])
+  let activeTrackId = $state<number | null>(null)
+  let libraryLoading = $state(true)
+  let libraryError = $state('')
+  let trackSearch = $state('')
+  let savedSettingsKey = $state('')
+  let saveMessage = $state('')
+  let trackPendingDelete = $state<LibraryTrack | null>(null)
+  let deletingTrack = $state(false)
 
   let filePath = $state('')
   let fileContent = $state('')
@@ -32,37 +56,81 @@
   let baseAudioDuration = $state(0)
   let previewIteration = $state(0)
   let previewLoops = $state(1)
-  let hasFile = $derived(fileContent.length > 0)
   let duration = $derived(meta ? ((endCycle - startCycle) / meta.cps) * loops : 0)
   let isBusy = $derived(appStatus === 'analyzing' || appStatus === 'rendering_preview' || appStatus === 'rendering_export')
   let isRendering = $derived(appStatus === 'rendering_preview' || appStatus === 'rendering_export')
   let hasPreview = $derived(previewUrl.length > 0)
+  let visibleTracks = $derived(
+    tracks.filter((track) => {
+      const query = trackSearch.trim().toLocaleLowerCase()
+      return !query || track.name.toLocaleLowerCase().includes(query) || track.sourcePath.toLocaleLowerCase().includes(query)
+    }),
+  )
+  let settingsDirty = $derived(activeTrackId !== null && savedSettingsKey !== serializedSettings())
+
+  onMount(() => {
+    void refreshTracks()
+  })
+
+  async function refreshTracks() {
+    libraryLoading = true
+    try {
+      tracks = await listTracks()
+      libraryError = ''
+    } catch (err) {
+      libraryError = `Erro ao carregar biblioteca: ${err}`
+    } finally {
+      libraryLoading = false
+    }
+  }
 
   async function pickFile() {
     const selected = await open({
       filters: [{ name: 'Strudel', extensions: ['strudel', 'js'] }],
       multiple: false,
     })
-    if (typeof selected === 'string') await loadFile(selected)
+    if (typeof selected === 'string') await addTrack(selected)
   }
 
-  async function loadFile(path: string) {
+  async function addTrack(path: string) {
     try {
-      filePath = path
-      const name = path.split(/[/\\]/).pop() ?? path
-      trackName = name.replace(/\.(strudel|js)$/i, '')
-      const { invoke } = await import('@tauri-apps/api/core')
+      const track = await importLibraryTrack(path)
+      await refreshTracks()
+      await openTrack(track)
+    } catch (err) {
+      libraryError = `Erro ao importar arquivo: ${err}`
+    }
+  }
+
+  async function openTrack(track: LibraryTrack) {
+    try {
+      clearPreview()
+      screen = 'track'
+      activeTrackId = track.id
+      filePath = track.sourcePath
+      trackName = track.settings.exportFileName
+      loops = track.settings.loops
+      startCycle = track.settings.startCycle
+      endCycle = track.settings.endCycle
+      sampleRate = track.settings.sampleRate
+      maxPolyphony = track.settings.maxPolyphony
+      automaticRange = track.settings.rangeMode === 'automatic'
+      savedSettingsKey = JSON.stringify(track.settings)
+      saveMessage = ''
       meta = null
-      fileContent = await invoke<string>('read_strudel_file', { path })
       appStatus = 'analyzing'
+      fileContent = await invoke<string>('read_strudel_file', { path: track.sourcePath })
       meta = await analyzeStrudel(fileContent)
-      useDetectedRange(false)
+      if (automaticRange) {
+        startCycle = 0
+        endCycle = meta.minLoopCycles
+        if (savedSettingsKey !== serializedSettings()) await saveTrackConfiguration(false)
+      }
       appStatus = 'idle'
       errorMsg = ''
-      clearPreview()
     } catch (err) {
       appStatus = 'error'
-      errorMsg = `Erro ao importar arquivo: ${err}`
+      errorMsg = `Erro ao abrir Track: ${err}`
     }
   }
 
@@ -80,7 +148,7 @@
     const file = e.dataTransfer?.files[0]
     if (!file) return
     const path = (file as any).path
-    if (path) loadFile(path)
+    if (path) addTrack(path)
   }
 
   function clearPreview() {
@@ -96,7 +164,7 @@
     previewLoops = 1
   }
 
-  function reset() {
+  function closeTrack() {
     renderController?.abort()
     clearPreview()
     filePath = ''
@@ -115,6 +183,11 @@
     progressLabel = ''
     renderController = null
     cancelRequested = false
+    activeTrackId = null
+    savedSettingsKey = ''
+    saveMessage = ''
+    screen = 'library'
+    void refreshTracks()
   }
 
   function updateProgress(progress: number, label: string) {
@@ -160,6 +233,67 @@
 
   function currentRenderSettings(): RenderSettings {
     return { startCycle, endCycle, sampleRate, maxPolyphony }
+  }
+
+  function currentSavedSettings(): SavedTrackSettings {
+    return {
+      rangeMode: automaticRange ? 'automatic' : 'manual',
+      startCycle,
+      endCycle,
+      loops,
+      sampleRate,
+      maxPolyphony,
+      exportFileName: trackName,
+    }
+  }
+
+  function serializedSettings() {
+    return JSON.stringify(currentSavedSettings())
+  }
+
+  async function saveTrackConfiguration(showMessage = true) {
+    if (activeTrackId === null) return
+    normalizeLoops()
+    normalizeRenderSettings(false)
+    normalizeTrackName()
+    try {
+      const updated = await saveTrackSettings(activeTrackId, currentSavedSettings())
+      savedSettingsKey = JSON.stringify(updated.settings)
+      tracks = tracks.map((track) => track.id === updated.id ? updated : track)
+      if (showMessage) saveMessage = 'Configuração salva'
+      errorMsg = ''
+    } catch (err) {
+      appStatus = 'error'
+      errorMsg = `Erro ao salvar configuração: ${err}`
+    }
+  }
+
+  function requestTrackRemoval(track: LibraryTrack, event: MouseEvent) {
+    event.stopPropagation()
+    trackPendingDelete = track
+  }
+
+  function cancelTrackRemoval() {
+    if (!deletingTrack) trackPendingDelete = null
+  }
+
+  async function confirmTrackRemoval() {
+    if (!trackPendingDelete || deletingTrack) return
+    deletingTrack = true
+    try {
+      await deleteLibraryTrack(trackPendingDelete.id)
+      tracks = tracks.filter((item) => item.id !== trackPendingDelete?.id)
+      trackPendingDelete = null
+    } catch (err) {
+      libraryError = `Erro ao remover Track: ${err}`
+    } finally {
+      deletingTrack = false
+    }
+  }
+
+  function formatLibraryDate(timestamp: number) {
+    return new Intl.DateTimeFormat('pt-BR', { dateStyle: 'short', timeStyle: 'short' })
+      .format(new Date(timestamp * 1000))
   }
 
   function cancelGeneration() {
@@ -318,31 +452,103 @@
   ></audio>
 {/if}
 
+<svelte:window onkeydown={(event) => event.key === 'Escape' && cancelTrackRemoval()} />
+
 <main>
   <header>
-    <img src="/assets/logo.png" alt="Strudel logo" class="logo-sm" />
-    <span class="app-name">Strudel WAV Exporter</span>
+    <div class="brand">
+      <img src="/assets/logo.png" alt="Strudel logo" class="logo-sm" />
+      <span class="app-name">Strudel Library</span>
+    </div>
+    {#if screen === 'library'}
+      <div class="header-actions">
+        <button class="btn-tags" type="button" disabled title="Será implementado na próxima fase">Tags</button>
+        <button class="btn-import" type="button" onclick={pickFile}>+ Importar Track</button>
+      </div>
+    {:else}
+      <button class="btn-back" type="button" onclick={closeTrack} disabled={isBusy}>← Biblioteca</button>
+    {/if}
   </header>
 
-  {#if !hasFile}
-    <div
-      class="drop-zone"
-      class:dragging={isDragging}
-      role="button"
-      tabindex="0"
-      aria-label="Arraste um arquivo .strudel ou clique para escolher"
-      onclick={pickFile}
-      onkeydown={(e) => e.key === 'Enter' && pickFile()}
-      ondragover={handleDragOver}
-      ondragleave={handleDragLeave}
-      ondrop={handleDrop}
-    >
-      <img src="/assets/logo.png" alt="" class="logo-watermark" aria-hidden="true" />
-      <div class="drop-text">
-        <p class="drop-main">Arraste seu arquivo <span class="ext">.strudel</span></p>
-        <p class="drop-sub">ou clique para escolher</p>
+  {#if screen === 'library'}
+    <section class="library-view">
+      <div class="home-tabs" role="tablist" aria-label="Biblioteca">
+        <button class:active={homeTab === 'tracks'} role="tab" aria-selected={homeTab === 'tracks'} onclick={() => homeTab = 'tracks'}>
+          Tracks <span>{tracks.length}</span>
+        </button>
+        <button class:active={homeTab === 'albums'} role="tab" aria-selected={homeTab === 'albums'} onclick={() => homeTab = 'albums'}>
+          Albums <span>0</span>
+        </button>
       </div>
-    </div>
+
+      {#if homeTab === 'tracks'}
+        <div class="library-toolbar">
+          <input bind:value={trackSearch} type="search" placeholder="Buscar por nome ou caminho…" aria-label="Buscar Tracks" />
+          <span>{visibleTracks.length} {visibleTracks.length === 1 ? 'Track' : 'Tracks'}</span>
+        </div>
+
+        {#if libraryLoading}
+          <div class="library-state"><span class="spinner"></span> Carregando biblioteca…</div>
+        {:else if visibleTracks.length === 0}
+          <div
+            class="drop-zone library-empty"
+            class:dragging={isDragging}
+            role="button"
+            tabindex="0"
+            aria-label="Arraste um arquivo .strudel ou clique para importar"
+            onclick={pickFile}
+            onkeydown={(e) => e.key === 'Enter' && pickFile()}
+            ondragover={handleDragOver}
+            ondragleave={handleDragLeave}
+            ondrop={handleDrop}
+          >
+            <img src="/assets/logo.png" alt="" class="logo-watermark" aria-hidden="true" />
+            <div class="drop-text">
+              <p class="drop-main">Sua biblioteca está vazia</p>
+              <p class="drop-sub">Arraste um arquivo <span class="ext">.strudel</span> ou clique para importar</p>
+            </div>
+          </div>
+        {:else}
+          <div class="track-grid">
+            {#each visibleTracks as track (track.id)}
+              <div
+                class="track-card"
+                role="button"
+                tabindex="0"
+                onclick={() => openTrack(track)}
+                onkeydown={(event) => event.key === 'Enter' && openTrack(track)}
+              >
+                <div class="track-card-icon">♪</div>
+                <div class="track-card-body">
+                  <strong>{track.name}</strong>
+                  <span class="track-path">{track.sourcePath}</span>
+                  <div class="track-card-meta">
+                    <span>{track.settings.endCycle - track.settings.startCycle} cycles</span>
+                    <span>{track.settings.loops}× loop</span>
+                    <span>{(track.settings.sampleRate / 1000).toFixed(1)} kHz</span>
+                    <span>{formatLibraryDate(track.updatedAt)}</span>
+                  </div>
+                </div>
+                <button class="track-delete" type="button" onclick={(event) => requestTrackRemoval(track, event)} aria-label={`Remover ${track.name} da biblioteca`}>×</button>
+              </div>
+            {/each}
+          </div>
+        {/if}
+      {:else}
+        <div class="coming-soon">
+          <span>◎</span>
+          <strong>Albums entram na próxima fase</strong>
+          <p>A fundação de Tracks e configurações persistidas já prepara o relacionamento ordenado do Album.</p>
+        </div>
+      {/if}
+
+      {#if libraryError}
+        <div class="error-banner">
+          <span>{libraryError}</span>
+          <button onclick={() => libraryError = ''}>×</button>
+        </div>
+      {/if}
+    </section>
   {:else}
     <div class="file-card">
       <div class="file-card-header">
@@ -352,7 +558,7 @@
           <path d="M6 8h8M6 11h6M6 14h4" stroke="currentColor" stroke-width="1.2" stroke-linecap="round" opacity=".5"/>
         </svg>
         <span class="file-name">{filePath.split('/').pop()}</span>
-        <button class="close-btn" onclick={reset} aria-label="Remover arquivo" disabled={isBusy}>×</button>
+        <button class="close-btn" onclick={closeTrack} aria-label="Voltar à biblioteca" disabled={isBusy}>×</button>
       </div>
       {#if meta}
         <div class="file-meta">
@@ -496,6 +702,16 @@
         Cycles {startCycle} → {endCycle} · {(sampleRate / 1000).toFixed(1)} kHz · {maxPolyphony} vozes
       </div>
 
+      <div class="save-config-row" class:dirty={settingsDirty}>
+        <div>
+          <strong>{settingsDirty ? 'Alterações não salvas' : 'Configuração salva'}</strong>
+          <span>{saveMessage || 'Esta configuração será restaurada ao abrir a Track.'}</span>
+        </div>
+        <button type="button" onclick={() => saveTrackConfiguration()} disabled={isBusy || !settingsDirty}>
+          Salvar configuração
+        </button>
+      </div>
+
       <div class="action-row">
         <button
           class="btn-preview"
@@ -600,6 +816,33 @@
   {/if}
 </main>
 
+{#if trackPendingDelete}
+  <div class="modal-backdrop">
+    <button class="modal-dismiss" type="button" onclick={cancelTrackRemoval} aria-label="Fechar confirmação"></button>
+    <div
+      class="confirm-modal"
+      role="dialog"
+      aria-modal="true"
+      aria-labelledby="remove-track-title"
+    >
+      <div class="modal-icon" aria-hidden="true">×</div>
+      <div class="modal-copy">
+        <h2 id="remove-track-title">Remover Track?</h2>
+        <p>
+          <strong>{trackPendingDelete.name}</strong> será removida da biblioteca junto com sua configuração salva.
+        </p>
+        <p class="modal-note">O arquivo <code>.strudel</code> original não será excluído.</p>
+      </div>
+      <div class="modal-actions">
+        <button class="modal-cancel" type="button" onclick={cancelTrackRemoval} disabled={deletingTrack}>Cancelar</button>
+        <button class="modal-confirm" type="button" onclick={confirmTrackRemoval} disabled={deletingTrack}>
+          {deletingTrack ? 'Removendo…' : 'Remover da biblioteca'}
+        </button>
+      </div>
+    </div>
+  </div>
+{/if}
+
 <style>
   :global(*, *::before, *::after) { box-sizing: border-box; margin: 0; padding: 0; }
   :global(body) {
@@ -624,10 +867,81 @@
   header {
     display: flex;
     align-items: center;
+    justify-content: space-between;
     gap: 12px;
   }
+  .brand, .header-actions { display: flex; align-items: center; gap: 12px; }
   .logo-sm { width: 28px; height: 28px; object-fit: contain; }
   .app-name { font-size: 15px; font-weight: 500; color: #8a8aa0; letter-spacing: 0.01em; }
+  .btn-import, .btn-back, .btn-tags {
+    padding: 8px 12px; border-radius: 7px; font: 500 12px 'Space Grotesk', sans-serif;
+    cursor: pointer;
+  }
+  .btn-import { background: #c8861e; color: #0c0c12; border: 0; }
+  .btn-import:hover { background: #d9971f; }
+  .btn-back, .btn-tags { background: #151522; color: #88889b; border: 1px solid #29293a; }
+  .btn-back:hover:not(:disabled) { color: #c8861e; border-color: #6a4a22; }
+  .btn-back:disabled, .btn-tags:disabled { opacity: 0.4; cursor: not-allowed; }
+
+  /* ── Library ── */
+  .library-view { flex: 1; min-height: 0; display: flex; flex-direction: column; gap: 16px; }
+  .home-tabs { display: flex; gap: 4px; border-bottom: 1px solid #20202e; }
+  .home-tabs button {
+    display: flex; align-items: center; gap: 7px; padding: 10px 14px;
+    background: transparent; color: #55556a; border: 0; border-bottom: 2px solid transparent;
+    font: 500 13px 'Space Grotesk', sans-serif; cursor: pointer;
+  }
+  .home-tabs button.active { color: #d4d0c7; border-bottom-color: #c8861e; }
+  .home-tabs button span {
+    min-width: 18px; padding: 2px 5px; border-radius: 999px;
+    background: #1a1a28; color: #77778c; font: 10px 'JetBrains Mono', monospace;
+  }
+  .library-toolbar { display: flex; align-items: center; gap: 14px; }
+  .library-toolbar input {
+    flex: 1; min-width: 0; padding: 10px 13px;
+    background: #131320; color: #d8d4cb; border: 1px solid #242435; border-radius: 8px;
+    outline: none; font: 12px 'Space Grotesk', sans-serif;
+  }
+  .library-toolbar input:focus { border-color: #c8861e; }
+  .library-toolbar > span { color: #45455a; font: 11px 'JetBrains Mono', monospace; white-space: nowrap; }
+  .library-state { flex: 1; display: flex; align-items: center; justify-content: center; gap: 9px; color: #5e5e73; font-size: 13px; }
+  .library-empty { min-height: 300px; }
+  .track-grid {
+    display: grid; grid-template-columns: repeat(auto-fill, minmax(310px, 1fr));
+    gap: 12px; align-content: start;
+  }
+  .track-card {
+    display: flex; align-items: center; gap: 12px; min-width: 0; padding: 14px;
+    background: #131320; border: 1px solid #20202f; border-radius: 9px;
+    cursor: pointer; outline: none; transition: border-color 140ms, transform 140ms, background 140ms;
+  }
+  .track-card:hover, .track-card:focus-visible {
+    background: #161624; border-color: #664820; transform: translateY(-1px);
+  }
+  .track-card-icon {
+    display: grid; place-items: center; width: 38px; height: 38px; flex: 0 0 auto;
+    background: rgba(200, 134, 30, 0.1); color: #c8861e; border-radius: 8px; font-size: 18px;
+  }
+  .track-card-body { min-width: 0; flex: 1; display: flex; flex-direction: column; gap: 5px; }
+  .track-card-body strong { color: #d8d4cb; font-size: 14px; font-weight: 600; }
+  .track-path {
+    overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+    color: #4b4b60; font: 10px 'JetBrains Mono', monospace;
+  }
+  .track-card-meta { display: flex; flex-wrap: wrap; gap: 5px 10px; color: #67677c; font-size: 10px; }
+  .track-delete {
+    align-self: flex-start; flex: 0 0 auto; width: 24px; height: 24px;
+    background: transparent; color: #45455a; border: 0; border-radius: 5px;
+    cursor: pointer; font-size: 17px;
+  }
+  .track-delete:hover { background: rgba(200, 80, 80, 0.1); color: #d06b6b; }
+  .coming-soon {
+    flex: 1; display: flex; flex-direction: column; align-items: center; justify-content: center;
+    gap: 9px; min-height: 300px; color: #4b4b60; text-align: center;
+  }
+  .coming-soon > span { color: #c8861e; font-size: 34px; opacity: 0.55; }
+  .coming-soon strong { color: #848496; font-size: 15px; }
+  .coming-soon p { max-width: 440px; font-size: 12px; line-height: 1.55; }
 
   /* ── Drop zone ── */
   .drop-zone {
@@ -814,6 +1128,21 @@
   .duration-sep { color: #2a2a3a; }
   .loops-hint { font-size: 12px; color: #38384a; }
   .render-summary { color: #38384a; font: 11px 'JetBrains Mono', monospace; }
+  .save-config-row {
+    display: flex; align-items: center; justify-content: space-between; gap: 14px;
+    padding: 10px 12px; background: rgba(82, 132, 93, 0.06);
+    border: 1px solid #26372b; border-radius: 7px;
+  }
+  .save-config-row.dirty { background: rgba(200, 134, 30, 0.06); border-color: #4b3a22; }
+  .save-config-row > div { display: flex; flex-direction: column; gap: 2px; }
+  .save-config-row strong { color: #7d9a82; font-size: 11px; }
+  .save-config-row.dirty strong { color: #c8861e; }
+  .save-config-row span { color: #45455a; font-size: 10px; }
+  .save-config-row button {
+    padding: 7px 10px; white-space: nowrap; background: #1b1b28; color: #c8861e;
+    border: 1px solid #5a421f; border-radius: 6px; cursor: pointer; font-size: 11px;
+  }
+  .save-config-row button:disabled { opacity: 0.35; cursor: not-allowed; }
 
   /* ── Action buttons ── */
   .action-row { display: flex; gap: 10px; }
@@ -941,6 +1270,44 @@
     font-size: 16px; cursor: pointer; opacity: 0.6; padding: 0 4px;
   }
   .error-banner button:hover { opacity: 1; }
+
+  /* ── Confirmation modal ── */
+  .modal-backdrop {
+    position: fixed; inset: 0; z-index: 1000;
+    display: grid; place-items: center; padding: 24px;
+    background: rgba(5, 5, 9, 0.78); backdrop-filter: blur(4px);
+  }
+  .modal-dismiss {
+    position: absolute; inset: 0; width: 100%; height: 100%;
+    background: transparent; border: 0; cursor: default;
+  }
+  .confirm-modal {
+    position: relative; z-index: 1;
+    width: min(440px, 100%); padding: 22px;
+    background: #151520; border: 1px solid #303043; border-radius: 12px;
+    box-shadow: 0 24px 80px rgba(0, 0, 0, 0.55);
+  }
+  .modal-icon {
+    display: grid; place-items: center; width: 38px; height: 38px; margin-bottom: 15px;
+    border-radius: 50%; background: rgba(200, 80, 80, 0.12); color: #d66f6f;
+    font-size: 23px; line-height: 1;
+  }
+  .modal-copy { display: flex; flex-direction: column; gap: 8px; }
+  .modal-copy h2 { color: #e0dcd4; font-size: 18px; font-weight: 600; }
+  .modal-copy p { color: #77778c; font-size: 13px; line-height: 1.5; }
+  .modal-copy p strong { color: #c7c3ba; }
+  .modal-copy .modal-note { color: #56566b; font-size: 12px; }
+  .modal-copy code { color: #c8861e; font-family: 'JetBrains Mono', monospace; }
+  .modal-actions { display: flex; justify-content: flex-end; gap: 9px; margin-top: 22px; }
+  .modal-actions button {
+    padding: 9px 13px; border-radius: 7px;
+    font: 500 12px 'Space Grotesk', sans-serif; cursor: pointer;
+  }
+  .modal-cancel { background: #1c1c2a; color: #9999aa; border: 1px solid #303043; }
+  .modal-cancel:hover:not(:disabled) { border-color: #4b4b61; }
+  .modal-confirm { background: #b94f4f; color: #fff; border: 1px solid #c75a5a; }
+  .modal-confirm:hover:not(:disabled) { background: #ca5858; }
+  .modal-actions button:disabled { opacity: 0.5; cursor: wait; }
 
   @media (prefers-reduced-motion: reduce) {
     .spinner { animation: none; }
