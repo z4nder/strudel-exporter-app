@@ -29,6 +29,39 @@ export interface LibraryTrack {
   updatedAt: number
 }
 
+export interface AlbumSummary {
+  id: number
+  name: string
+  description: string
+  coverPath: string | null
+  sampleRate: 44100 | 48000 | 96000
+  defaultGapSeconds: number
+  trackCount: number
+  tags: LibraryTag[]
+  createdAt: number
+  updatedAt: number
+}
+
+export interface AlbumTrackSettings {
+  rangeMode: RangeMode
+  startCycle: number
+  endCycle: number
+  loops: number
+  maxPolyphony: number
+  gapAfterSeconds: number
+}
+
+export interface AlbumTrackItem {
+  id: number
+  position: number
+  track: LibraryTrack
+  settings: AlbumTrackSettings
+}
+
+export interface LibraryAlbum extends AlbumSummary {
+  tracks: AlbumTrackItem[]
+}
+
 export function listTracks(): Promise<LibraryTrack[]> {
   return invoke('library_list_tracks')
 }
@@ -66,4 +99,48 @@ export function deleteTag(tagId: number): Promise<void> {
 
 export function setTrackTag(trackId: number, tagId: number, attached: boolean): Promise<LibraryTrack> {
   return invoke('library_set_track_tag', { trackId, tagId, attached })
+}
+
+export function listAlbums(): Promise<AlbumSummary[]> {
+  return invoke('library_list_albums')
+}
+
+export function getAlbum(albumId: number): Promise<LibraryAlbum> {
+  return invoke('library_get_album', { albumId })
+}
+
+export interface AlbumFields {
+  name: string
+  description: string
+  coverPath: string | null
+  sampleRate: 44100 | 48000 | 96000
+  defaultGapSeconds: number
+}
+
+export function createAlbum(fields: AlbumFields): Promise<LibraryAlbum> {
+  return invoke('library_create_album', fields)
+}
+
+export function updateAlbum(albumId: number, fields: AlbumFields): Promise<LibraryAlbum> {
+  return invoke('library_update_album', { albumId, ...fields })
+}
+
+export function deleteAlbum(albumId: number): Promise<void> {
+  return invoke('library_delete_album', { albumId })
+}
+
+export function addAlbumTrack(albumId: number, trackId: number): Promise<LibraryAlbum> {
+  return invoke('library_add_album_track', { albumId, trackId })
+}
+
+export function updateAlbumTrack(itemId: number, settings: AlbumTrackSettings): Promise<LibraryAlbum> {
+  return invoke('library_update_album_track', { itemId, settings })
+}
+
+export function removeAlbumTrack(itemId: number): Promise<LibraryAlbum> {
+  return invoke('library_remove_album_track', { itemId })
+}
+
+export function reorderAlbumTracks(albumId: number, itemIds: number[]): Promise<LibraryAlbum> {
+  return invoke('library_reorder_album_tracks', { albumId, itemIds })
 }

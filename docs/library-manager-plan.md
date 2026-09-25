@@ -1,8 +1,8 @@
 # Plano — Strudel Library Manager
 
-Status: em implementação. As fases de fundação, biblioteca de Tracks e Tags já
-possuem SQLite, CRUD, configuração persistida, badges e filtros. Albums permanece
-na fase seguinte.
+Status: MVP implementado. Fundação, Tracks, Tags e Albums possuem persistência
+SQLite e os fluxos de preview/export usam o render oficial do Strudel. O
+acabamento e o monitoramento de sources continuam como evoluções posteriores.
 
 Este documento descreve a evolução do exportador atual para uma biblioteca
 local de Tracks e Albums. O renderizador Strudel, a detecção de round, o cache
@@ -88,9 +88,8 @@ o item do Album. A partir desse momento ela é independente.
 Isso evita que editar a Track posteriormente altere silenciosamente um Album já
 montado. No item do Album existirão as ações:
 
-- `Salvar neste Album`;
+- salvamento automático ao alterar os campos;
 - `Recarregar padrão da Track`;
-- `Aplicar esta configuração como padrão da Track` — exige confirmação.
 
 O item salva:
 
@@ -271,7 +270,7 @@ Exportar WAV
 ```text
 Capa, nome e descrição
 Sample rate e gap padrão
-Tracks ordenáveis por drag-and-drop
+Tracks ordenáveis por controles subir/descer
 Configuração e preview de cada item
 Timeline calculada
 Exportar Album completo
@@ -291,7 +290,7 @@ Etapas:
 5. inserir o silêncio configurado após cada faixa;
 6. concatenar o PCM sem recompressão;
 7. gravar o WAV final;
-8. gravar manifesto JSON e copiar a capa, se houver;
+8. gravar manifesto JSON, incluindo o caminho da capa, se houver;
 9. entregar os arquivos no destino escolhido pelo usuário.
 
 Se a operação falhar, arquivos temporários são removidos. A gravação final deve
@@ -304,7 +303,6 @@ O export gera, por padrão:
 ```text
 Meu Album.wav
 Meu Album.json
-Meu Album-cover.png
 ```
 
 Exemplo resumido:
@@ -457,23 +455,23 @@ Critério: filtros continuam corretos após editar ou excluir uma tag.
 
 ### Fase 4 — Albums
 
-- CRUD com nome, descrição e capa;
-- adicionar a mesma Track uma ou mais vezes;
-- copiar a configuração padrão ao adicionar;
-- salvar overrides independentes;
-- reorder transacional;
-- cálculo da timeline.
+- [x] CRUD com nome, descrição e capa;
+- [x] adicionar a mesma Track uma ou mais vezes;
+- [x] copiar a configuração padrão ao adicionar;
+- [x] salvar overrides independentes;
+- [x] reorder transacional;
+- [x] cálculo da timeline.
 
 Critério: editar um item do Album não altera a configuração padrão da Track.
 
 ### Fase 5 — Preview e export de Album
 
-- preview individual dos itens;
-- sample rate único do Album;
-- concatenação, gaps e progresso;
-- cancelamento seguro;
-- WAV, manifesto e capa;
-- entrega dos arquivos no destino escolhido, sem histórico local.
+- [x] preview individual dos itens;
+- [x] sample rate único do Album;
+- [x] concatenação, gaps e progresso;
+- [x] cancelamento do render no browser;
+- [x] WAV e manifesto JSON com timeline em precisão de frame;
+- [x] entrega dos arquivos no destino escolhido, sem histórico local.
 
 Critério: offsets e duração do manifesto correspondem ao WAV em nível de frame.
 

@@ -1,26 +1,40 @@
 <script lang="ts">
   import { onMount } from 'svelte'
   import { open } from '@tauri-apps/plugin-dialog'
-  import { invoke } from '@tauri-apps/api/core'
+  import { convertFileSrc, invoke } from '@tauri-apps/api/core'
   import { formatDuration, type StrudelMeta } from './lib/loop-parser'
   import { analyzeStrudel, renderToUrl, exportToWav, type RenderSettings } from './lib/strudel-runner'
   import {
     createTag,
+    createAlbum,
+    addAlbumTrack,
+    deleteAlbum,
     deleteTag,
     deleteTrack as deleteLibraryTrack,
     importTrack as importLibraryTrack,
     listTags,
+    listAlbums,
+    getAlbum,
     listTracks,
     saveTrackSettings,
     setTrackTag,
+    removeAlbumTrack,
+    reorderAlbumTracks,
+    updateAlbum,
+    updateAlbumTrack,
     updateTag,
     type LibraryTag,
+    type AlbumSummary,
+    type AlbumTrackItem,
+    type AlbumTrackSettings,
+    type LibraryAlbum,
     type LibraryTrack,
     type SavedTrackSettings,
   } from './lib/library'
+  import { exportAlbumToWav } from './lib/album-exporter'
 
   type AppStatus = 'idle' | 'analyzing' | 'rendering_preview' | 'rendering_export' | 'error'
-  type AppScreen = 'library' | 'track'
+  type AppScreen = 'library' | 'track' | 'album'
   type HomeTab = 'tracks' | 'albums'
 
   let screen = $state<AppScreen>('library')
@@ -44,6 +58,23 @@
   let tagError = $state('')
   let tagPendingDelete = $state<LibraryTag | null>(null)
   let tagLinkSavingId = $state<number | null>(null)
+  let albums = $state<AlbumSummary[]>([])
+  let activeAlbum = $state<LibraryAlbum | null>(null)
+  let albumModalOpen = $state(false)
+  let editingAlbumId = $state<number | null>(null)
+  let albumName = $state('')
+  let albumDescription = $state('')
+  let albumCoverPath = $state<string | null>(null)
+  let albumSampleRate = $state<44100 | 48000 | 96000>(44100)
+  let albumDefaultGap = $state(0)
+  let albumSaving = $state(false)
+  let albumError = $state('')
+  let albumPendingDelete = $state<AlbumSummary | null>(null)
+  let albumTrackPickerOpen = $state(false)
+  let albumItemSavingId = $state<number | null>(null)
+  let albumPreviewItemId = $state<number | null>(null)
+  let albumCpsByItem = $state<Record<number, number>>({})
+  let albumItemPendingRemove = $state<AlbumTrackItem | null>(null)
 
   let filePath = $state('')
   let fileContent = $state('')
@@ -85,6 +116,12 @@
     }),
   )
   let settingsDirty = $derived(activeTrackId !== null && savedSettingsKey !== serializedSettings())
+  let albumDuration = $derived(
+    activeAlbum?.tracks.reduce((total, item) => {
+      const cps = albumCpsByItem[item.id]
+      return total + (cps ? ((item.settings.endCycle - item.settings.startCycle) / cps) * item.settings.loops : 0) + item.settings.gapAfterSeconds
+    }, 0) ?? 0,
+  )
 
   onMount(() => {
     void refreshTracks()
@@ -93,9 +130,10 @@
   async function refreshTracks() {
     libraryLoading = true
     try {
-      const [loadedTracks, loadedTags] = await Promise.all([listTracks(), listTags()])
+      const [loadedTracks, loadedTags, loadedAlbums] = await Promise.all([listTracks(), listTags(), listAlbums()])
       tracks = loadedTracks
       tags = loadedTags
+      albums = loadedAlbums
       selectedTagIds = selectedTagIds.filter((tagId) => loadedTags.some((tag) => tag.id === tagId))
       libraryError = ''
     } catch (err) {
@@ -299,7 +337,15 @@
   }
 
   function handleEscape() {
-    if (tagPendingDelete && !tagSaving) {
+    if (albumItemPendingRemove && albumItemSavingId === null) {
+      albumItemPendingRemove = null
+    } else if (albumPendingDelete && !albumSaving) {
+      albumPendingDelete = null
+    } else if (albumTrackPickerOpen) {
+      albumTrackPickerOpen = false
+    } else if (albumModalOpen) {
+      closeAlbumModal()
+    } else if (tagPendingDelete && !tagSaving) {
       tagPendingDelete = null
     } else if (tagManagerOpen) {
       closeTagManager()
@@ -409,6 +455,269 @@
       appStatus = 'error'
     } finally {
       tagLinkSavingId = null
+    }
+  }
+
+  function resetAlbumForm() {
+    editingAlbumId = null
+    albumName = ''
+    albumDescription = ''
+    albumCoverPath = null
+    albumSampleRate = 44100
+    albumDefaultGap = 0
+    albumError = ''
+  }
+
+  function openAlbumCreator() {
+    resetAlbumForm()
+    albumModalOpen = true
+  }
+
+  function openAlbumEditor(album: AlbumSummary | LibraryAlbum) {
+    editingAlbumId = album.id
+    albumName = album.name
+    albumDescription = album.description
+    albumCoverPath = album.coverPath
+    albumSampleRate = album.sampleRate
+    albumDefaultGap = album.defaultGapSeconds
+    albumError = ''
+    albumModalOpen = true
+  }
+
+  function closeAlbumModal() {
+    if (!albumSaving) albumModalOpen = false
+  }
+
+  async function chooseAlbumCover() {
+    const selected = await open({
+      filters: [{ name: 'Imagem', extensions: ['png', 'jpg', 'jpeg', 'webp'] }],
+      multiple: false,
+    })
+    if (typeof selected === 'string') albumCoverPath = selected
+  }
+
+  async function submitAlbum() {
+    if (albumSaving || !albumName.trim()) return
+    albumSaving = true
+    albumError = ''
+    try {
+      const fields = {
+        name: albumName,
+        description: albumDescription,
+        coverPath: albumCoverPath,
+        sampleRate: albumSampleRate,
+        defaultGapSeconds: Math.max(0, Number(albumDefaultGap) || 0),
+      }
+      const album = editingAlbumId === null
+        ? await createAlbum(fields)
+        : await updateAlbum(editingAlbumId, fields)
+      albumModalOpen = false
+      await refreshTracks()
+      if (screen === 'album' && activeAlbum?.id === album.id) activeAlbum = album
+      if (editingAlbumId === null) await openAlbum(album)
+    } catch (err) {
+      albumError = String(err)
+    } finally {
+      albumSaving = false
+    }
+  }
+
+  async function openAlbum(album: AlbumSummary | LibraryAlbum) {
+    try {
+      clearPreview()
+      albumPreviewItemId = null
+      albumCpsByItem = {}
+      activeAlbum = 'tracks' in album ? album : await getAlbum(album.id)
+      screen = 'album'
+      appStatus = 'idle'
+      errorMsg = ''
+      void analyzeAlbumTracks()
+    } catch (err) {
+      libraryError = `Erro ao abrir Album: ${err}`
+    }
+  }
+
+  function closeAlbum() {
+    renderController?.abort()
+    clearPreview()
+    activeAlbum = null
+    albumPreviewItemId = null
+    albumCpsByItem = {}
+    screen = 'library'
+    void refreshTracks()
+  }
+
+  async function analyzeAlbumTracks() {
+    const album = activeAlbum
+    if (!album) return
+    for (const item of album.tracks) {
+      try {
+        const code = await invoke<string>('read_strudel_file', { path: item.track.sourcePath })
+        const analysis = await analyzeStrudel(code)
+        if (activeAlbum?.id !== album.id) return
+        albumCpsByItem = { ...albumCpsByItem, [item.id]: analysis.cps }
+      } catch {
+        // The export/preview action will expose the concrete source error.
+      }
+    }
+  }
+
+  function albumItemDuration(item: AlbumTrackItem) {
+    const cps = albumCpsByItem[item.id]
+    return cps ? ((item.settings.endCycle - item.settings.startCycle) / cps) * item.settings.loops : 0
+  }
+
+  async function addTrackToActiveAlbum(trackId: number) {
+    if (!activeAlbum || albumSaving) return
+    albumSaving = true
+    try {
+      activeAlbum = await addAlbumTrack(activeAlbum.id, trackId)
+      albumTrackPickerOpen = false
+      await refreshTracks()
+      void analyzeAlbumTracks()
+    } catch (err) {
+      errorMsg = `Erro ao adicionar Track: ${err}`
+      appStatus = 'error'
+    } finally {
+      albumSaving = false
+    }
+  }
+
+  async function saveAlbumItem(item: AlbumTrackItem) {
+    if (!activeAlbum || albumItemSavingId !== null) return
+    item.settings.startCycle = Math.max(0, Number(item.settings.startCycle) || 0)
+    item.settings.endCycle = Math.max(item.settings.startCycle + 0.25, Number(item.settings.endCycle) || item.settings.startCycle + 1)
+    item.settings.loops = Math.min(999, Math.max(1, Math.round(Number(item.settings.loops) || 1)))
+    item.settings.maxPolyphony = Math.min(256, Math.max(1, Math.round(Number(item.settings.maxPolyphony) || 32)))
+    item.settings.gapAfterSeconds = Math.max(0, Number(item.settings.gapAfterSeconds) || 0)
+    albumItemSavingId = item.id
+    try {
+      activeAlbum = await updateAlbumTrack(item.id, item.settings)
+    } catch (err) {
+      errorMsg = `Erro ao salvar faixa do Album: ${err}`
+      appStatus = 'error'
+    } finally {
+      albumItemSavingId = null
+    }
+  }
+
+  async function restoreAlbumItemDefaults(item: AlbumTrackItem) {
+    item.settings = {
+      rangeMode: item.track.settings.rangeMode,
+      startCycle: item.track.settings.startCycle,
+      endCycle: item.track.settings.endCycle,
+      loops: item.track.settings.loops,
+      maxPolyphony: item.track.settings.maxPolyphony,
+      gapAfterSeconds: activeAlbum?.defaultGapSeconds ?? 0,
+    }
+    await saveAlbumItem(item)
+  }
+
+  async function moveAlbumItem(index: number, direction: -1 | 1) {
+    if (!activeAlbum || albumItemSavingId !== null) return
+    const target = index + direction
+    if (target < 0 || target >= activeAlbum.tracks.length) return
+    const ordered = [...activeAlbum.tracks]
+    ;[ordered[index], ordered[target]] = [ordered[target], ordered[index]]
+    albumItemSavingId = ordered[target].id
+    try {
+      activeAlbum = await reorderAlbumTracks(activeAlbum.id, ordered.map((item) => item.id))
+    } catch (err) {
+      errorMsg = `Erro ao reordenar Album: ${err}`
+      appStatus = 'error'
+    } finally {
+      albumItemSavingId = null
+    }
+  }
+
+  async function confirmAlbumItemRemoval() {
+    if (!albumItemPendingRemove || albumItemSavingId !== null) return
+    albumItemSavingId = albumItemPendingRemove.id
+    try {
+      activeAlbum = await removeAlbumTrack(albumItemPendingRemove.id)
+      albumItemPendingRemove = null
+      await refreshTracks()
+    } catch (err) {
+      errorMsg = `Erro ao remover faixa do Album: ${err}`
+      appStatus = 'error'
+    } finally {
+      albumItemSavingId = null
+    }
+  }
+
+  async function generateAlbumItemPreview(item: AlbumTrackItem) {
+    if (!activeAlbum || isBusy) return
+    clearPreview()
+    albumPreviewItemId = item.id
+    previewLoops = item.settings.loops
+    renderProgress = 0
+    progressLabel = `Preparando ${item.track.name}…`
+    cancelRequested = false
+    const controller = new AbortController()
+    renderController = controller
+    appStatus = 'rendering_preview'
+    try {
+      const code = await invoke<string>('read_strudel_file', { path: item.track.sourcePath })
+      previewUrl = await renderToUrl(
+        code,
+        item.settings.loops,
+        {
+          startCycle: item.settings.startCycle,
+          endCycle: item.settings.endCycle,
+          sampleRate: activeAlbum.sampleRate,
+          maxPolyphony: item.settings.maxPolyphony,
+        },
+        updateProgress,
+        controller.signal,
+      )
+      appStatus = 'idle'
+    } catch (err) {
+      if (controller.signal.aborted) appStatus = 'idle'
+      else {
+        appStatus = 'error'
+        errorMsg = `Erro no preview do Album: ${err}`
+      }
+    } finally {
+      if (renderController === controller) renderController = null
+      cancelRequested = false
+    }
+  }
+
+  async function exportActiveAlbum() {
+    if (!activeAlbum || isBusy) return
+    renderProgress = 0
+    progressLabel = 'Iniciando Album…'
+    cancelRequested = false
+    const controller = new AbortController()
+    renderController = controller
+    appStatus = 'rendering_export'
+    try {
+      await exportAlbumToWav(activeAlbum, updateProgress, controller.signal)
+      appStatus = 'idle'
+    } catch (err) {
+      if (controller.signal.aborted) appStatus = 'idle'
+      else {
+        appStatus = 'error'
+        errorMsg = `Erro ao exportar Album: ${err}`
+      }
+    } finally {
+      if (renderController === controller) renderController = null
+      cancelRequested = false
+    }
+  }
+
+  async function confirmAlbumRemoval() {
+    if (!albumPendingDelete || albumSaving) return
+    albumSaving = true
+    try {
+      await deleteAlbum(albumPendingDelete.id)
+      if (activeAlbum?.id === albumPendingDelete.id) closeAlbum()
+      albumPendingDelete = null
+      await refreshTracks()
+    } catch (err) {
+      libraryError = `Erro ao excluir Album: ${err}`
+    } finally {
+      albumSaving = false
     }
   }
 
@@ -579,10 +888,14 @@
     {#if screen === 'library'}
       <div class="header-actions">
         <button class="btn-tags" type="button" onclick={openTagManager}>Tags</button>
-        <button class="btn-import" type="button" onclick={pickFile}>+ Importar Track</button>
+        {#if homeTab === 'tracks'}
+          <button class="btn-import" type="button" onclick={pickFile}>+ Importar Track</button>
+        {:else}
+          <button class="btn-import" type="button" onclick={openAlbumCreator}>+ Novo Album</button>
+        {/if}
       </div>
     {:else}
-      <button class="btn-back" type="button" onclick={closeTrack} disabled={isBusy}>← Biblioteca</button>
+      <button class="btn-back" type="button" onclick={screen === 'track' ? closeTrack : closeAlbum} disabled={isBusy}>← Biblioteca</button>
     {/if}
   </header>
 
@@ -593,7 +906,7 @@
           Tracks <span>{tracks.length}</span>
         </button>
         <button class:active={homeTab === 'albums'} role="tab" aria-selected={homeTab === 'albums'} onclick={() => homeTab = 'albums'}>
-          Albums <span>0</span>
+          Albums <span>{albums.length}</span>
         </button>
       </div>
 
@@ -677,11 +990,41 @@
           </div>
         {/if}
       {:else}
-        <div class="coming-soon">
-          <span>◎</span>
-          <strong>Albums entram na próxima fase</strong>
-          <p>A fundação de Tracks e configurações persistidas já prepara o relacionamento ordenado do Album.</p>
-        </div>
+        {#if albums.length === 0}
+          <div class="coming-soon">
+            <span>◎</span>
+            <strong>Nenhum Album criado</strong>
+            <p>Crie um Album para organizar Tracks, definir a ordem e exportar um WAV completo.</p>
+            <button class="btn-import" type="button" onclick={openAlbumCreator}>+ Criar primeiro Album</button>
+          </div>
+        {:else}
+          <div class="album-grid">
+            {#each albums as album (album.id)}
+              <div class="album-card" role="button" tabindex="0" onclick={() => openAlbum(album)} onkeydown={(event) => event.key === 'Enter' && openAlbum(album)}>
+                <div class="album-cover">
+                  {#if album.coverPath}
+                    <img src={convertFileSrc(album.coverPath)} alt={`Capa de ${album.name}`} />
+                  {:else}
+                    <span>◎</span>
+                  {/if}
+                </div>
+                <div class="album-card-copy">
+                  <strong>{album.name}</strong>
+                  <p>{album.description || 'Sem descrição'}</p>
+                  {#if album.tags.length > 0}
+                    <div class="track-badges">
+                      {#each album.tags as tag (tag.id)}
+                        <span style={`--tag-color: ${tag.color}`}><i></i>{tag.name}</span>
+                      {/each}
+                    </div>
+                  {/if}
+                  <div><span>{album.trackCount} {album.trackCount === 1 ? 'Track' : 'Tracks'}</span><span>{(album.sampleRate / 1000).toFixed(1)} kHz</span></div>
+                </div>
+                <button class="track-delete" type="button" onclick={(event) => { event.stopPropagation(); albumPendingDelete = album }} aria-label={`Excluir ${album.name}`}>×</button>
+              </div>
+            {/each}
+          </div>
+        {/if}
       {/if}
 
       {#if libraryError}
@@ -691,7 +1034,7 @@
         </div>
       {/if}
     </section>
-  {:else}
+  {:else if screen === 'track'}
     <div class="file-card">
       <div class="file-card-header">
         <svg class="file-icon" viewBox="0 0 20 20" fill="none" aria-hidden="true">
@@ -976,6 +1319,139 @@
         </div>
       {/if}
     </section>
+  {:else if activeAlbum}
+    <section class="album-detail">
+      <div class="album-detail-header">
+        <div class="album-detail-cover">
+          {#if activeAlbum.coverPath}
+            <img src={convertFileSrc(activeAlbum.coverPath)} alt={`Capa de ${activeAlbum.name}`} />
+          {:else}
+            <span aria-hidden="true">♫</span>
+          {/if}
+        </div>
+        <div class="album-detail-copy">
+          <span class="album-eyebrow">ALBUM</span>
+          <h1>{activeAlbum.name}</h1>
+          <p>{activeAlbum.description || 'Sem descrição.'}</p>
+          <div class="album-detail-meta">
+            <span>{activeAlbum.tracks.length} {activeAlbum.tracks.length === 1 ? 'faixa' : 'faixas'}</span>
+            <span>{activeAlbum.sampleRate.toLocaleString('pt-BR')} Hz</span>
+            <span>{formatDuration(albumDuration)}</span>
+          </div>
+        </div>
+        <div class="album-header-actions">
+          <button type="button" onclick={() => openAlbumEditor(activeAlbum!)} disabled={isBusy}>Editar Album</button>
+          <button class="album-add-track" type="button" onclick={() => albumTrackPickerOpen = true} disabled={isBusy}>+ Adicionar Track</button>
+        </div>
+      </div>
+
+      {#if activeAlbum.tracks.length === 0}
+        <div class="album-empty">
+          <span aria-hidden="true">＋</span>
+          <strong>Este Album ainda está vazio</strong>
+          <p>Adicione Tracks da biblioteca. A mesma Track pode aparecer mais de uma vez.</p>
+          <button type="button" onclick={() => albumTrackPickerOpen = true}>Adicionar primeira Track</button>
+        </div>
+      {:else}
+        <div class="album-track-list">
+          {#each activeAlbum.tracks as item, index (item.id)}
+            <article class="album-track-item">
+              <div class="album-track-heading">
+                <span class="album-track-position">{String(index + 1).padStart(2, '0')}</span>
+                <div class="album-track-copy">
+                  <strong>{item.track.name}</strong>
+                  <span>{item.track.sourcePath}</span>
+                  {#if item.track.tags.length > 0}
+                    <div class="track-badges">
+                      {#each item.track.tags as tag (tag.id)}
+                        <span style={`--tag-color: ${tag.color}`}><i></i>{tag.name}</span>
+                      {/each}
+                    </div>
+                  {/if}
+                </div>
+                <div class="album-track-duration">
+                  <strong>{formatDuration(albumItemDuration(item))}</strong>
+                  {#if item.settings.gapAfterSeconds > 0}<span>+ {item.settings.gapAfterSeconds}s pausa</span>{/if}
+                </div>
+                <div class="album-order-actions">
+                  <button type="button" aria-label="Mover faixa para cima" onclick={() => moveAlbumItem(index, -1)} disabled={index === 0 || isBusy || albumItemSavingId !== null}>↑</button>
+                  <button type="button" aria-label="Mover faixa para baixo" onclick={() => moveAlbumItem(index, 1)} disabled={index === activeAlbum!.tracks.length - 1 || isBusy || albumItemSavingId !== null}>↓</button>
+                </div>
+                <button class="album-remove-track" type="button" aria-label="Remover faixa do Album" onclick={() => albumItemPendingRemove = item} disabled={isBusy || albumItemSavingId !== null}>×</button>
+              </div>
+
+              <div class="album-item-settings">
+                <label>
+                  <span>Start cycle</span>
+                  <input type="number" min="0" step="0.25" bind:value={item.settings.startCycle} onchange={() => { item.settings.rangeMode = 'manual'; void saveAlbumItem(item) }} disabled={isBusy || albumItemSavingId !== null} />
+                </label>
+                <label>
+                  <span>End cycle</span>
+                  <input type="number" min="0.25" step="0.25" bind:value={item.settings.endCycle} onchange={() => { item.settings.rangeMode = 'manual'; void saveAlbumItem(item) }} disabled={isBusy || albumItemSavingId !== null} />
+                </label>
+                <label>
+                  <span>Loops</span>
+                  <input type="number" min="1" max="999" step="1" bind:value={item.settings.loops} onchange={() => saveAlbumItem(item)} disabled={isBusy || albumItemSavingId !== null} />
+                </label>
+                <label>
+                  <span>Polifonia</span>
+                  <input type="number" min="1" max="256" step="1" bind:value={item.settings.maxPolyphony} onchange={() => saveAlbumItem(item)} disabled={isBusy || albumItemSavingId !== null} />
+                </label>
+                <label>
+                  <span>Pausa depois (s)</span>
+                  <input type="number" min="0" max="3600" step="0.1" bind:value={item.settings.gapAfterSeconds} onchange={() => saveAlbumItem(item)} disabled={isBusy || albumItemSavingId !== null} />
+                </label>
+                <div class="album-item-actions">
+                  <button type="button" onclick={() => restoreAlbumItemDefaults(item)} disabled={isBusy || albumItemSavingId !== null}>Restaurar Track</button>
+                  <button class="album-item-preview" type="button" onclick={() => generateAlbumItemPreview(item)} disabled={isBusy || albumItemSavingId !== null}>
+                    {albumPreviewItemId === item.id && appStatus === 'rendering_preview' ? 'Gerando…' : '▶ Preview'}
+                  </button>
+                </div>
+              </div>
+
+              {#if albumPreviewItemId === item.id && hasPreview}
+                <div class="player album-player">
+                  <div class="player-loop-info">Preview desta faixa × {previewLoops}</div>
+                  <div class="player-controls">
+                    <button class="player-btn" onclick={togglePlay} aria-label={audioPlaying ? 'Pausar' : 'Reproduzir'}>
+                      {audioPlaying ? 'Ⅱ' : '▶'}
+                    </button>
+                    <button class="player-btn" onclick={stopAudio} aria-label="Parar">■</button>
+                    <span class="player-time">{formatTime(audioTime)}</span>
+                    <input class="player-seek" type="range" min="0" max={audioDuration || 0} step="0.01" value={audioTime} oninput={seek} aria-label="Posição" />
+                    <span class="player-time player-time-total">{formatTime(audioDuration)}</span>
+                  </div>
+                </div>
+              {/if}
+            </article>
+          {/each}
+        </div>
+      {/if}
+
+      {#if isRendering}
+        <div class="render-progress album-render-progress">
+          <div class="progress-copy"><span>{progressLabel}</span><span>{Math.round(renderProgress * 100)}%</span></div>
+          <div class="progress-track" role="progressbar" aria-label="Geração do Album" aria-valuemin="0" aria-valuemax="100" aria-valuenow={Math.round(renderProgress * 100)}>
+            <div class="progress-fill" style={`width: ${Math.round(renderProgress * 100)}%`}></div>
+          </div>
+          <button class="btn-cancel" type="button" onclick={cancelGeneration} disabled={cancelRequested}>{cancelRequested ? 'Cancelando…' : 'Cancelar geração'}</button>
+        </div>
+      {/if}
+
+      {#if appStatus === 'error'}
+        <div class="error-banner"><span>{errorMsg}</span><button onclick={() => { appStatus = 'idle'; errorMsg = '' }}>×</button></div>
+      {/if}
+
+      <div class="album-export-bar">
+        <div>
+          <strong>Exportar Album completo</strong>
+          <span>WAV único + manifesto JSON com timeline, Tags e configurações.</span>
+        </div>
+        <button class="btn-export" type="button" onclick={exportActiveAlbum} disabled={isBusy || activeAlbum.tracks.length === 0}>
+          {appStatus === 'rendering_export' ? 'Renderizando Album…' : 'Exportar Album WAV'}
+        </button>
+      </div>
+    </section>
   {/if}
 </main>
 
@@ -1073,6 +1549,121 @@
           {/if}
         </div>
       {/if}
+    </div>
+  </div>
+{/if}
+
+{#if albumModalOpen}
+  <div class="modal-backdrop">
+    <button class="modal-dismiss" type="button" onclick={closeAlbumModal} aria-label="Fechar formulário do Album"></button>
+    <form class="confirm-modal album-modal" onsubmit={(event) => { event.preventDefault(); void submitAlbum() }}>
+      <div class="tag-modal-header">
+        <div>
+          <h2>{editingAlbumId === null ? 'Novo Album' : 'Editar Album'}</h2>
+          <p>Os ajustes do Album não alteram a configuração original das Tracks.</p>
+        </div>
+        <button type="button" onclick={closeAlbumModal} aria-label="Fechar">×</button>
+      </div>
+
+      <div class="album-form">
+        <label class="album-form-wide">
+          <span>Nome</span>
+          <input bind:value={albumName} maxlength="120" placeholder="Nome do Album" disabled={albumSaving} required />
+        </label>
+        <label class="album-form-wide">
+          <span>Descrição</span>
+          <textarea bind:value={albumDescription} maxlength="2000" rows="3" placeholder="Sobre este Album" disabled={albumSaving}></textarea>
+        </label>
+        <div class="album-cover-field album-form-wide">
+          <span>Capa</span>
+          <div>
+            <div class="album-cover-preview">
+              {#if albumCoverPath}<img src={convertFileSrc(albumCoverPath)} alt="Prévia da capa" />{:else}<span>♫</span>{/if}
+            </div>
+            <button type="button" onclick={chooseAlbumCover} disabled={albumSaving}>Escolher imagem</button>
+            {#if albumCoverPath}<button class="album-cover-remove" type="button" onclick={() => albumCoverPath = null} disabled={albumSaving}>Remover</button>{/if}
+          </div>
+          {#if albumCoverPath}<code title={albumCoverPath}>{albumCoverPath}</code>{/if}
+        </div>
+        <label>
+          <span>Sample rate</span>
+          <select bind:value={albumSampleRate} disabled={albumSaving}>
+            <option value={44100}>44.100 Hz</option>
+            <option value={48000}>48.000 Hz</option>
+            <option value={96000}>96.000 Hz</option>
+          </select>
+        </label>
+        <label>
+          <span>Pausa padrão (s)</span>
+          <input type="number" min="0" max="3600" step="0.1" bind:value={albumDefaultGap} disabled={albumSaving} />
+        </label>
+      </div>
+
+      {#if albumError}<div class="tag-error">{albumError}</div>{/if}
+      <div class="modal-actions">
+        <button class="modal-cancel" type="button" onclick={closeAlbumModal} disabled={albumSaving}>Cancelar</button>
+        <button class="album-save" type="submit" disabled={albumSaving || !albumName.trim()}>{albumSaving ? 'Salvando…' : 'Salvar Album'}</button>
+      </div>
+    </form>
+  </div>
+{/if}
+
+{#if albumTrackPickerOpen && activeAlbum}
+  <div class="modal-backdrop">
+    <button class="modal-dismiss" type="button" onclick={() => albumTrackPickerOpen = false} aria-label="Fechar seleção de Track"></button>
+    <div class="confirm-modal album-picker-modal" role="dialog" aria-modal="true" aria-labelledby="album-picker-title">
+      <div class="tag-modal-header">
+        <div><h2 id="album-picker-title">Adicionar Track</h2><p>Escolha uma Track. Ela pode ser adicionada novamente em outra posição.</p></div>
+        <button type="button" onclick={() => albumTrackPickerOpen = false} aria-label="Fechar">×</button>
+      </div>
+      <div class="album-picker-list">
+        {#if tracks.length === 0}
+          <p>Nenhuma Track importada na biblioteca.</p>
+        {:else}
+          {#each tracks as track (track.id)}
+            <div class="album-picker-item">
+              <div><strong>{track.name}</strong><span>{track.sourcePath}</span></div>
+              <button type="button" onclick={() => addTrackToActiveAlbum(track.id)} disabled={albumSaving}>Adicionar</button>
+            </div>
+          {/each}
+        {/if}
+      </div>
+    </div>
+  </div>
+{/if}
+
+{#if albumPendingDelete}
+  <div class="modal-backdrop">
+    <button class="modal-dismiss" type="button" onclick={() => albumPendingDelete = null} aria-label="Fechar confirmação"></button>
+    <div class="confirm-modal" role="dialog" aria-modal="true" aria-labelledby="remove-album-title">
+      <div class="modal-icon" aria-hidden="true">×</div>
+      <div class="modal-copy">
+        <h2 id="remove-album-title">Excluir Album?</h2>
+        <p><strong>{albumPendingDelete.name}</strong> e sua ordem/configuração serão removidos.</p>
+        <p class="modal-note">As Tracks e os arquivos <code>.strudel</code> não serão excluídos.</p>
+      </div>
+      <div class="modal-actions">
+        <button class="modal-cancel" type="button" onclick={() => albumPendingDelete = null} disabled={albumSaving}>Cancelar</button>
+        <button class="modal-confirm" type="button" onclick={confirmAlbumRemoval} disabled={albumSaving}>{albumSaving ? 'Excluindo…' : 'Excluir Album'}</button>
+      </div>
+    </div>
+  </div>
+{/if}
+
+{#if albumItemPendingRemove}
+  <div class="modal-backdrop">
+    <button class="modal-dismiss" type="button" onclick={() => albumItemPendingRemove = null} aria-label="Fechar confirmação"></button>
+    <div class="confirm-modal" role="dialog" aria-modal="true" aria-labelledby="remove-album-track-title">
+      <div class="modal-icon" aria-hidden="true">×</div>
+      <div class="modal-copy">
+        <h2 id="remove-album-track-title">Remover faixa do Album?</h2>
+        <p><strong>{albumItemPendingRemove.track.name}</strong> será retirada somente desta posição do Album.</p>
+        <p class="modal-note">A Track permanece na biblioteca.</p>
+      </div>
+      <div class="modal-actions">
+        <button class="modal-cancel" type="button" onclick={() => albumItemPendingRemove = null} disabled={albumItemSavingId !== null}>Cancelar</button>
+        <button class="modal-confirm" type="button" onclick={confirmAlbumItemRemoval} disabled={albumItemSavingId !== null}>{albumItemSavingId !== null ? 'Removendo…' : 'Remover faixa'}</button>
+      </div>
     </div>
   </div>
 {/if}
@@ -1195,6 +1786,103 @@
   .coming-soon > span { color: #c8861e; font-size: 34px; opacity: 0.55; }
   .coming-soon strong { color: #848496; font-size: 15px; }
   .coming-soon p { max-width: 440px; font-size: 12px; line-height: 1.55; }
+
+  .album-grid {
+    display: grid; grid-template-columns: repeat(auto-fill, minmax(350px, 1fr));
+    gap: 14px; align-content: start;
+  }
+  .album-card {
+    display: grid; grid-template-columns: 76px minmax(0, 1fr) auto; gap: 13px;
+    padding: 12px; background: #131320; border: 1px solid #20202f; border-radius: 10px;
+    cursor: pointer; outline: none; transition: border-color 140ms, transform 140ms;
+  }
+  .album-card:hover, .album-card:focus-visible { border-color: #664820; transform: translateY(-1px); }
+  .album-cover, .album-detail-cover, .album-cover-preview {
+    overflow: hidden; display: grid; place-items: center; background: #1b1b28; color: #876427;
+  }
+  .album-cover { width: 76px; aspect-ratio: 1; border-radius: 7px; font-size: 25px; }
+  .album-cover img, .album-detail-cover img, .album-cover-preview img { width: 100%; height: 100%; object-fit: cover; }
+  .album-card-copy { min-width: 0; display: flex; flex-direction: column; justify-content: center; gap: 5px; }
+  .album-card-copy strong { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: #d8d4cb; font-size: 14px; }
+  .album-card-copy p { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: #57576b; font-size: 11px; }
+  .album-card-copy > div { display: flex; gap: 10px; color: #77778c; font-size: 10px; }
+
+  /* ── Album detail ── */
+  .album-detail { display: flex; flex-direction: column; gap: 16px; min-height: 0; }
+  .album-detail-header {
+    display: grid; grid-template-columns: 112px minmax(0, 1fr) auto; gap: 18px; align-items: center;
+    padding: 16px; background: linear-gradient(135deg, #171724, #11111b); border: 1px solid #242434; border-radius: 11px;
+  }
+  .album-detail-cover { width: 112px; aspect-ratio: 1; border-radius: 8px; font-size: 34px; }
+  .album-detail-copy { min-width: 0; }
+  .album-eyebrow { color: #c8861e; font: 9px 'JetBrains Mono', monospace; letter-spacing: .16em; }
+  .album-detail-copy h1 { margin-top: 4px; color: #e5e1d9; font-size: 25px; line-height: 1.15; }
+  .album-detail-copy > p { margin-top: 7px; max-width: 680px; color: #68687d; font-size: 12px; line-height: 1.45; }
+  .album-detail-meta { display: flex; gap: 14px; margin-top: 10px; color: #89899a; font: 10px 'JetBrains Mono', monospace; }
+  .album-header-actions { display: flex; flex-direction: column; gap: 8px; }
+  .album-header-actions button, .album-empty button {
+    padding: 8px 11px; background: #1b1b29; color: #9696a7; border: 1px solid #333345; border-radius: 6px;
+    cursor: pointer; font: 500 11px 'Space Grotesk', sans-serif;
+  }
+  .album-header-actions .album-add-track, .album-empty button { background: #c8861e; color: #0c0c12; border-color: #c8861e; }
+  .album-header-actions button:disabled { opacity: .45; cursor: not-allowed; }
+  .album-empty {
+    display: flex; flex-direction: column; align-items: center; gap: 8px; padding: 44px;
+    background: #11111b; border: 1px dashed #303041; border-radius: 10px; text-align: center;
+  }
+  .album-empty > span { color: #c8861e; font-size: 28px; }
+  .album-empty strong { color: #aaa6a0; font-size: 14px; }
+  .album-empty p { margin-bottom: 8px; color: #55556a; font-size: 11px; }
+  .album-track-list { display: flex; flex-direction: column; gap: 9px; }
+  .album-track-item { background: #12121d; border: 1px solid #222231; border-radius: 9px; overflow: hidden; }
+  .album-track-heading {
+    display: grid; grid-template-columns: 34px minmax(0, 1fr) auto auto 25px; gap: 10px; align-items: center;
+    padding: 12px 13px;
+  }
+  .album-track-position { color: #c8861e; font: 12px 'JetBrains Mono', monospace; }
+  .album-track-copy { min-width: 0; display: flex; flex-direction: column; gap: 3px; }
+  .album-track-copy > strong { color: #d2cec6; font-size: 13px; }
+  .album-track-copy > span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: #444459; font: 9px 'JetBrains Mono', monospace; }
+  .album-track-copy .track-badges { margin-top: 2px; }
+  .album-track-duration { display: flex; flex-direction: column; align-items: flex-end; gap: 2px; }
+  .album-track-duration strong { color: #9999aa; font: 11px 'JetBrains Mono', monospace; }
+  .album-track-duration span { color: #56566b; font-size: 9px; }
+  .album-order-actions { display: flex; gap: 3px; }
+  .album-order-actions button, .album-remove-track {
+    width: 25px; height: 25px; background: #1b1b28; color: #77778c; border: 1px solid #2d2d3e; border-radius: 5px; cursor: pointer;
+  }
+  .album-order-actions button:disabled, .album-remove-track:disabled { opacity: .3; cursor: not-allowed; }
+  .album-remove-track { background: transparent; color: #a95e5e; border: 0; font-size: 17px; }
+  .album-item-settings {
+    display: grid; grid-template-columns: repeat(5, minmax(90px, 1fr)) auto; gap: 8px; align-items: end;
+    padding: 10px 13px 12px; background: #0f0f18; border-top: 1px solid #1d1d2b;
+  }
+  .album-item-settings label { display: flex; flex-direction: column; gap: 5px; }
+  .album-item-settings label span { color: #55556a; font-size: 9px; }
+  .album-item-settings input {
+    width: 100%; height: 32px; padding: 6px 8px; background: #181825; color: #ccc8c0;
+    border: 1px solid #29293a; border-radius: 5px; outline: none; font: 11px 'JetBrains Mono', monospace;
+  }
+  .album-item-settings input:focus { border-color: #c8861e; }
+  .album-item-settings input:disabled { opacity: .45; }
+  .album-item-actions { display: flex; gap: 5px; }
+  .album-item-actions button {
+    height: 32px; padding: 0 8px; white-space: nowrap; background: transparent; color: #77778c;
+    border: 1px solid #303041; border-radius: 5px; cursor: pointer; font-size: 9px;
+  }
+  .album-item-actions .album-item-preview { color: #c8861e; border-color: #59431f; }
+  .album-item-actions button:disabled { opacity: .4; cursor: not-allowed; }
+  .album-player { margin: 0 13px 12px; }
+  .album-render-progress { position: sticky; bottom: 78px; z-index: 4; box-shadow: 0 10px 30px #09090f; }
+  .album-export-bar {
+    position: sticky; bottom: -32px; z-index: 3; display: flex; align-items: center; gap: 20px;
+    padding: 13px 15px; background: rgba(18, 18, 29, .96); border: 1px solid #29293a; border-radius: 9px;
+    backdrop-filter: blur(8px);
+  }
+  .album-export-bar > div { min-width: 0; flex: 1; display: flex; flex-direction: column; gap: 3px; }
+  .album-export-bar strong { color: #c9c5bd; font-size: 12px; }
+  .album-export-bar span { color: #55556a; font-size: 10px; }
+  .album-export-bar .btn-export { flex: 0 0 auto; min-width: 190px; padding: 10px 14px; }
 
   /* ── Drop zone ── */
   .drop-zone {
@@ -1625,6 +2313,53 @@
   }
   .tag-list-item button:hover { color: #c8861e; border-color: #674b23; }
   .tag-list-item .tag-remove:hover { color: #d06b6b; border-color: #663838; }
+
+  .album-modal { width: min(610px, 100%); max-height: calc(100vh - 48px); overflow-y: auto; }
+  .album-form { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; margin-top: 18px; }
+  .album-form label, .album-cover-field { display: flex; flex-direction: column; gap: 6px; }
+  .album-form label > span, .album-cover-field > span { color: #5d5d71; font-size: 10px; }
+  .album-form-wide { grid-column: 1 / -1; }
+  .album-form input, .album-form textarea, .album-form select {
+    width: 100%; padding: 9px 10px; background: #101019; color: #d5d1c9;
+    border: 1px solid #2b2b3d; border-radius: 6px; outline: none; font: 12px 'Space Grotesk', sans-serif;
+  }
+  .album-form select { color-scheme: dark; }
+  .album-form input:focus, .album-form textarea:focus, .album-form select:focus { border-color: #c8861e; }
+  .album-form textarea { resize: vertical; min-height: 74px; }
+  .album-cover-field > div { display: flex; align-items: center; gap: 8px; }
+  .album-cover-preview { width: 58px; height: 58px; flex: 0 0 auto; border-radius: 6px; }
+  .album-cover-field button {
+    padding: 7px 9px; background: #1b1b29; color: #9090a0; border: 1px solid #333345; border-radius: 5px; cursor: pointer; font-size: 10px;
+  }
+  .album-cover-field .album-cover-remove { color: #b26767; border-color: #563535; }
+  .album-cover-field code { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: #4d4d61; font: 9px 'JetBrains Mono', monospace; }
+  .album-save {
+    padding: 9px 13px; background: #c8861e; color: #0c0c12; border: 0; border-radius: 7px;
+    cursor: pointer; font: 600 12px 'Space Grotesk', sans-serif;
+  }
+  .album-save:disabled { opacity: .45; cursor: not-allowed; }
+  .album-picker-modal { width: min(620px, 100%); max-height: min(720px, calc(100vh - 48px)); overflow-y: auto; }
+  .album-picker-list { display: flex; flex-direction: column; gap: 6px; margin-top: 16px; }
+  .album-picker-list > p { padding: 32px; text-align: center; color: #55556a; font-size: 12px; }
+  .album-picker-item {
+    display: flex; align-items: center; gap: 12px; padding: 10px;
+    background: #101019; border: 1px solid #222231; border-radius: 7px;
+  }
+  .album-picker-item > div { min-width: 0; flex: 1; display: flex; flex-direction: column; gap: 3px; }
+  .album-picker-item strong { color: #c9c5bd; font-size: 12px; }
+  .album-picker-item span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: #49495d; font: 9px 'JetBrains Mono', monospace; }
+  .album-picker-item button {
+    padding: 6px 9px; background: transparent; color: #c8861e; border: 1px solid #5b4320; border-radius: 5px; cursor: pointer; font-size: 10px;
+  }
+  .album-picker-item button:disabled { opacity: .4; cursor: wait; }
+
+  @media (max-width: 900px) {
+    .album-detail-header { grid-template-columns: 90px minmax(0, 1fr); }
+    .album-detail-cover { width: 90px; }
+    .album-header-actions { grid-column: 1 / -1; flex-direction: row; }
+    .album-item-settings { grid-template-columns: repeat(3, minmax(90px, 1fr)); }
+    .album-item-actions { grid-column: span 2; }
+  }
 
   @media (prefers-reduced-motion: reduce) {
     .spinner { animation: none; }

@@ -40,6 +40,49 @@ pub struct Track {
     pub updated_at: i64,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct AlbumSummary {
+    pub id: i64,
+    pub name: String,
+    pub description: String,
+    pub cover_path: Option<String>,
+    pub sample_rate: u32,
+    pub default_gap_seconds: f64,
+    pub track_count: u32,
+    pub tags: Vec<Tag>,
+    pub created_at: i64,
+    pub updated_at: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct AlbumTrackSettings {
+    pub range_mode: String,
+    pub start_cycle: f64,
+    pub end_cycle: f64,
+    pub loops: u32,
+    pub max_polyphony: u32,
+    pub gap_after_seconds: f64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct AlbumTrackItem {
+    pub id: i64,
+    pub position: u32,
+    pub track: Track,
+    pub settings: AlbumTrackSettings,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct Album {
+    #[serde(flatten)]
+    pub summary: AlbumSummary,
+    pub tracks: Vec<AlbumTrackItem>,
+}
+
 fn now_timestamp() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -136,6 +179,31 @@ pub fn migrate(connection: &Connection) -> Result<(), String> {
                track_id INTEGER NOT NULL REFERENCES tracks(id) ON DELETE CASCADE,
                tag_id INTEGER NOT NULL REFERENCES tags(id) ON DELETE CASCADE,
                PRIMARY KEY(track_id, tag_id)
+             );
+             CREATE TABLE IF NOT EXISTS albums (
+               id INTEGER PRIMARY KEY AUTOINCREMENT,
+               name TEXT NOT NULL,
+               description TEXT NOT NULL DEFAULT '',
+               cover_path TEXT,
+               sample_rate INTEGER NOT NULL CHECK(sample_rate IN (44100, 48000, 96000)),
+               default_gap_seconds REAL NOT NULL CHECK(default_gap_seconds >= 0),
+               created_at INTEGER NOT NULL,
+               updated_at INTEGER NOT NULL
+             );
+             CREATE TABLE IF NOT EXISTS album_tracks (
+               id INTEGER PRIMARY KEY AUTOINCREMENT,
+               album_id INTEGER NOT NULL REFERENCES albums(id) ON DELETE CASCADE,
+               track_id INTEGER NOT NULL REFERENCES tracks(id) ON DELETE RESTRICT,
+               position INTEGER NOT NULL CHECK(position >= 0),
+               range_mode TEXT NOT NULL CHECK(range_mode IN ('automatic', 'manual')),
+               start_cycle REAL NOT NULL CHECK(start_cycle >= 0),
+               end_cycle REAL NOT NULL CHECK(end_cycle > start_cycle),
+               loops INTEGER NOT NULL CHECK(loops BETWEEN 1 AND 999),
+               max_polyphony INTEGER NOT NULL CHECK(max_polyphony BETWEEN 1 AND 256),
+               gap_after_seconds REAL NOT NULL CHECK(gap_after_seconds >= 0),
+               created_at INTEGER NOT NULL,
+               updated_at INTEGER NOT NULL,
+               UNIQUE(album_id, position)
              );",
         )
         .map_err(|e| e.to_string())
@@ -319,6 +387,412 @@ fn set_track_tag(
     find_track(connection, track_id)
 }
 
+fn validate_album_fields(
+    name: &str,
+    sample_rate: u32,
+    default_gap_seconds: f64,
+) -> Result<String, String> {
+    let name = name.trim();
+    if name.is_empty() || name.chars().count() > 120 {
+        return Err("o nome do Album deve ter entre 1 e 120 caracteres".to_string());
+    }
+    if ![44_100, 48_000, 96_000].contains(&sample_rate) {
+        return Err("sample rate inválido".to_string());
+    }
+    if !default_gap_seconds.is_finite() || default_gap_seconds < 0.0 {
+        return Err("o intervalo padrão deve ser maior ou igual a 0".to_string());
+    }
+    Ok(name.to_string())
+}
+
+fn validate_album_track_settings(settings: &AlbumTrackSettings) -> Result<(), String> {
+    if settings.range_mode != "automatic" && settings.range_mode != "manual" {
+        return Err("range_mode deve ser automatic ou manual".to_string());
+    }
+    if !settings.start_cycle.is_finite() || settings.start_cycle < 0.0 {
+        return Err("Start cycle deve ser maior ou igual a 0".to_string());
+    }
+    if !settings.end_cycle.is_finite() || settings.end_cycle <= settings.start_cycle {
+        return Err("End cycle deve ser maior que Start cycle".to_string());
+    }
+    if !(1..=999).contains(&settings.loops) {
+        return Err("loops deve estar entre 1 e 999".to_string());
+    }
+    if !(1..=256).contains(&settings.max_polyphony) {
+        return Err("maximum polyphony deve estar entre 1 e 256".to_string());
+    }
+    if !settings.gap_after_seconds.is_finite() || settings.gap_after_seconds < 0.0 {
+        return Err("o intervalo após a faixa deve ser maior ou igual a 0".to_string());
+    }
+    Ok(())
+}
+
+fn row_to_album_summary(row: &rusqlite::Row<'_>) -> rusqlite::Result<AlbumSummary> {
+    Ok(AlbumSummary {
+        id: row.get(0)?,
+        name: row.get(1)?,
+        description: row.get(2)?,
+        cover_path: row.get(3)?,
+        sample_rate: row.get(4)?,
+        default_gap_seconds: row.get(5)?,
+        track_count: row.get(6)?,
+        tags: Vec::new(),
+        created_at: row.get(7)?,
+        updated_at: row.get(8)?,
+    })
+}
+
+const ALBUM_SELECT: &str = "SELECT a.id, a.name, a.description, a.cover_path, a.sample_rate,
+            a.default_gap_seconds,
+            CAST((SELECT COUNT(*) FROM album_tracks at WHERE at.album_id = a.id) AS INTEGER),
+            a.created_at, a.updated_at
+       FROM albums a";
+
+fn album_tags(connection: &Connection, album_id: i64) -> Result<Vec<Tag>, String> {
+    let mut statement = connection
+        .prepare(
+            "SELECT DISTINCT t.id, t.name, t.color,
+                    CAST((SELECT COUNT(*) FROM track_tags tt2 WHERE tt2.tag_id = t.id) AS INTEGER)
+             FROM tags t
+             JOIN track_tags tt ON tt.tag_id = t.id
+             JOIN album_tracks at ON at.track_id = tt.track_id
+             WHERE at.album_id = ?1
+             ORDER BY t.name COLLATE NOCASE",
+        )
+        .map_err(|e| e.to_string())?;
+    let tags = statement
+        .query_map([album_id], |row| {
+            Ok(Tag {
+                id: row.get(0)?,
+                name: row.get(1)?,
+                color: row.get(2)?,
+                track_count: row.get(3)?,
+            })
+        })
+        .map_err(|e| e.to_string())?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| e.to_string())?;
+    Ok(tags)
+}
+
+fn list_albums(connection: &Connection) -> Result<Vec<AlbumSummary>, String> {
+    let mut statement = connection
+        .prepare(&format!(
+            "{ALBUM_SELECT} ORDER BY a.updated_at DESC, a.name COLLATE NOCASE"
+        ))
+        .map_err(|e| e.to_string())?;
+    let mut albums = statement
+        .query_map([], row_to_album_summary)
+        .map_err(|e| e.to_string())?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| e.to_string())?;
+    drop(statement);
+    for album in &mut albums {
+        album.tags = album_tags(connection, album.id)?;
+    }
+    Ok(albums)
+}
+
+fn find_album_summary(connection: &Connection, id: i64) -> Result<AlbumSummary, String> {
+    let mut album = connection
+        .query_row(
+            &format!("{ALBUM_SELECT} WHERE a.id = ?1"),
+            [id],
+            row_to_album_summary,
+        )
+        .optional()
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| "Album não encontrado".to_string())?;
+    album.tags = album_tags(connection, album.id)?;
+    Ok(album)
+}
+
+fn find_album(connection: &Connection, id: i64) -> Result<Album, String> {
+    let summary = find_album_summary(connection, id)?;
+    let mut statement = connection
+        .prepare(
+            "SELECT id, position, track_id, range_mode, start_cycle, end_cycle,
+                    loops, max_polyphony, gap_after_seconds
+               FROM album_tracks WHERE album_id = ?1 ORDER BY position",
+        )
+        .map_err(|e| e.to_string())?;
+    let rows = statement
+        .query_map([id], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, u32>(1)?,
+                row.get::<_, i64>(2)?,
+                AlbumTrackSettings {
+                    range_mode: row.get(3)?,
+                    start_cycle: row.get(4)?,
+                    end_cycle: row.get(5)?,
+                    loops: row.get(6)?,
+                    max_polyphony: row.get(7)?,
+                    gap_after_seconds: row.get(8)?,
+                },
+            ))
+        })
+        .map_err(|e| e.to_string())?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| e.to_string())?;
+    drop(statement);
+
+    let tracks = rows
+        .into_iter()
+        .map(|(item_id, position, track_id, settings)| {
+            Ok(AlbumTrackItem {
+                id: item_id,
+                position,
+                track: find_track(connection, track_id)?,
+                settings,
+            })
+        })
+        .collect::<Result<Vec<_>, String>>()?;
+    Ok(Album { summary, tracks })
+}
+
+fn create_album(
+    connection: &Connection,
+    name: &str,
+    description: &str,
+    cover_path: Option<String>,
+    sample_rate: u32,
+    default_gap_seconds: f64,
+) -> Result<Album, String> {
+    let name = validate_album_fields(name, sample_rate, default_gap_seconds)?;
+    let now = now_timestamp();
+    connection
+        .execute(
+            "INSERT INTO albums(name, description, cover_path, sample_rate,
+                                default_gap_seconds, created_at, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?6)",
+            params![
+                name,
+                description.trim(),
+                cover_path,
+                sample_rate,
+                default_gap_seconds,
+                now
+            ],
+        )
+        .map_err(|e| e.to_string())?;
+    find_album(connection, connection.last_insert_rowid())
+}
+
+fn update_album(
+    connection: &Connection,
+    id: i64,
+    name: &str,
+    description: &str,
+    cover_path: Option<String>,
+    sample_rate: u32,
+    default_gap_seconds: f64,
+) -> Result<Album, String> {
+    let name = validate_album_fields(name, sample_rate, default_gap_seconds)?;
+    let changed = connection
+        .execute(
+            "UPDATE albums SET name = ?1, description = ?2, cover_path = ?3,
+                               sample_rate = ?4, default_gap_seconds = ?5, updated_at = ?6
+             WHERE id = ?7",
+            params![
+                name,
+                description.trim(),
+                cover_path,
+                sample_rate,
+                default_gap_seconds,
+                now_timestamp(),
+                id
+            ],
+        )
+        .map_err(|e| e.to_string())?;
+    if changed == 0 {
+        return Err("Album não encontrado".to_string());
+    }
+    find_album(connection, id)
+}
+
+fn delete_album(connection: &Connection, id: i64) -> Result<(), String> {
+    let changed = connection
+        .execute("DELETE FROM albums WHERE id = ?1", [id])
+        .map_err(|e| e.to_string())?;
+    if changed == 0 {
+        return Err("Album não encontrado".to_string());
+    }
+    Ok(())
+}
+
+fn add_album_track(connection: &Connection, album_id: i64, track_id: i64) -> Result<Album, String> {
+    let album = find_album_summary(connection, album_id)?;
+    let track = find_track(connection, track_id)?;
+    let position: u32 = connection
+        .query_row(
+            "SELECT COALESCE(MAX(position) + 1, 0) FROM album_tracks WHERE album_id = ?1",
+            [album_id],
+            |row| row.get(0),
+        )
+        .map_err(|e| e.to_string())?;
+    let now = now_timestamp();
+    connection
+        .execute(
+            "INSERT INTO album_tracks(
+               album_id, track_id, position, range_mode, start_cycle, end_cycle,
+               loops, max_polyphony, gap_after_seconds, created_at, updated_at
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?10)",
+            params![
+                album_id,
+                track_id,
+                position,
+                track.settings.range_mode,
+                track.settings.start_cycle,
+                track.settings.end_cycle,
+                track.settings.loops,
+                track.settings.max_polyphony,
+                album.default_gap_seconds,
+                now,
+            ],
+        )
+        .map_err(|e| e.to_string())?;
+    connection
+        .execute(
+            "UPDATE albums SET updated_at = ?1 WHERE id = ?2",
+            params![now, album_id],
+        )
+        .map_err(|e| e.to_string())?;
+    find_album(connection, album_id)
+}
+
+fn update_album_track(
+    connection: &Connection,
+    item_id: i64,
+    settings: &AlbumTrackSettings,
+) -> Result<Album, String> {
+    validate_album_track_settings(settings)?;
+    let album_id: i64 = connection
+        .query_row(
+            "SELECT album_id FROM album_tracks WHERE id = ?1",
+            [item_id],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| "Faixa do Album não encontrada".to_string())?;
+    let now = now_timestamp();
+    connection
+        .execute(
+            "UPDATE album_tracks SET range_mode = ?1, start_cycle = ?2, end_cycle = ?3,
+                                     loops = ?4, max_polyphony = ?5,
+                                     gap_after_seconds = ?6, updated_at = ?7
+             WHERE id = ?8",
+            params![
+                settings.range_mode,
+                settings.start_cycle,
+                settings.end_cycle,
+                settings.loops,
+                settings.max_polyphony,
+                settings.gap_after_seconds,
+                now,
+                item_id,
+            ],
+        )
+        .map_err(|e| e.to_string())?;
+    connection
+        .execute(
+            "UPDATE albums SET updated_at = ?1 WHERE id = ?2",
+            params![now, album_id],
+        )
+        .map_err(|e| e.to_string())?;
+    find_album(connection, album_id)
+}
+
+fn remove_album_track(connection: &mut Connection, item_id: i64) -> Result<Album, String> {
+    let album_id: i64 = connection
+        .query_row(
+            "SELECT album_id FROM album_tracks WHERE id = ?1",
+            [item_id],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| "Faixa do Album não encontrada".to_string())?;
+    let transaction = connection.transaction().map_err(|e| e.to_string())?;
+    transaction
+        .execute("DELETE FROM album_tracks WHERE id = ?1", [item_id])
+        .map_err(|e| e.to_string())?;
+    let ids = {
+        let mut statement = transaction
+            .prepare("SELECT id FROM album_tracks WHERE album_id = ?1 ORDER BY position")
+            .map_err(|e| e.to_string())?;
+        let ids = statement
+            .query_map([album_id], |row| row.get::<_, i64>(0))
+            .map_err(|e| e.to_string())?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| e.to_string())?;
+        ids
+    };
+    for (position, id) in ids.iter().enumerate() {
+        transaction
+            .execute(
+                "UPDATE album_tracks SET position = ?1 WHERE id = ?2",
+                params![1_000_000 + position as u32, id],
+            )
+            .map_err(|e| e.to_string())?;
+    }
+    for (position, id) in ids.iter().enumerate() {
+        transaction
+            .execute(
+                "UPDATE album_tracks SET position = ?1 WHERE id = ?2",
+                params![position as u32, id],
+            )
+            .map_err(|e| e.to_string())?;
+    }
+    transaction.commit().map_err(|e| e.to_string())?;
+    find_album(connection, album_id)
+}
+
+fn reorder_album_tracks(
+    connection: &mut Connection,
+    album_id: i64,
+    item_ids: &[i64],
+) -> Result<Album, String> {
+    let current_ids = find_album(connection, album_id)?
+        .tracks
+        .into_iter()
+        .map(|item| item.id)
+        .collect::<Vec<_>>();
+    let mut expected = current_ids.clone();
+    let mut received = item_ids.to_vec();
+    expected.sort_unstable();
+    received.sort_unstable();
+    if expected != received {
+        return Err("a nova ordem deve conter exatamente as faixas do Album".to_string());
+    }
+    let transaction = connection.transaction().map_err(|e| e.to_string())?;
+    for (position, id) in item_ids.iter().enumerate() {
+        transaction
+            .execute(
+                "UPDATE album_tracks SET position = ?1 WHERE id = ?2 AND album_id = ?3",
+                params![1_000_000 + position as u32, id, album_id],
+            )
+            .map_err(|e| e.to_string())?;
+    }
+    for (position, id) in item_ids.iter().enumerate() {
+        transaction
+            .execute(
+                "UPDATE album_tracks SET position = ?1 WHERE id = ?2 AND album_id = ?3",
+                params![position as u32, id, album_id],
+            )
+            .map_err(|e| e.to_string())?;
+    }
+    transaction
+        .execute(
+            "UPDATE albums SET updated_at = ?1 WHERE id = ?2",
+            params![now_timestamp(), album_id],
+        )
+        .map_err(|e| e.to_string())?;
+    transaction.commit().map_err(|e| e.to_string())?;
+    find_album(connection, album_id)
+}
+
 fn list_tracks(connection: &Connection) -> Result<Vec<Track>, String> {
     let mut statement = connection
         .prepare(&format!(
@@ -424,14 +898,26 @@ fn save_track_settings(
     find_track(connection, track_id)
 }
 
-fn delete_track(connection: &Connection, track_id: i64) -> Result<(), String> {
-    let changed = connection
+fn delete_track(connection: &mut Connection, track_id: i64) -> Result<(), String> {
+    let transaction = connection.transaction().map_err(|e| e.to_string())?;
+    let now = now_timestamp();
+    transaction
+        .execute(
+            "UPDATE albums SET updated_at = ?1
+             WHERE id IN (SELECT album_id FROM album_tracks WHERE track_id = ?2)",
+            params![now, track_id],
+        )
+        .map_err(|e| e.to_string())?;
+    transaction
+        .execute("DELETE FROM album_tracks WHERE track_id = ?1", [track_id])
+        .map_err(|e| e.to_string())?;
+    let changed = transaction
         .execute("DELETE FROM tracks WHERE id = ?1", [track_id])
         .map_err(|e| e.to_string())?;
     if changed == 0 {
         return Err("Track não encontrada".to_string());
     }
-    Ok(())
+    transaction.commit().map_err(|e| e.to_string())
 }
 
 pub fn open(app: &AppHandle) -> Result<LibraryDb, String> {
@@ -467,8 +953,8 @@ pub fn library_save_track_settings(
 
 #[command]
 pub fn library_delete_track(track_id: i64, db: State<'_, LibraryDb>) -> Result<(), String> {
-    let connection = db.0.lock().map_err(|e| e.to_string())?;
-    delete_track(&connection, track_id)
+    let mut connection = db.0.lock().map_err(|e| e.to_string())?;
+    delete_track(&mut connection, track_id)
 }
 
 #[command]
@@ -513,6 +999,102 @@ pub fn library_set_track_tag(
 ) -> Result<Track, String> {
     let connection = db.0.lock().map_err(|e| e.to_string())?;
     set_track_tag(&connection, track_id, tag_id, attached)
+}
+
+#[command]
+pub fn library_list_albums(db: State<'_, LibraryDb>) -> Result<Vec<AlbumSummary>, String> {
+    let connection = db.0.lock().map_err(|e| e.to_string())?;
+    list_albums(&connection)
+}
+
+#[command]
+pub fn library_get_album(album_id: i64, db: State<'_, LibraryDb>) -> Result<Album, String> {
+    let connection = db.0.lock().map_err(|e| e.to_string())?;
+    find_album(&connection, album_id)
+}
+
+#[command]
+pub fn library_create_album(
+    name: String,
+    description: String,
+    cover_path: Option<String>,
+    sample_rate: u32,
+    default_gap_seconds: f64,
+    db: State<'_, LibraryDb>,
+) -> Result<Album, String> {
+    let connection = db.0.lock().map_err(|e| e.to_string())?;
+    create_album(
+        &connection,
+        &name,
+        &description,
+        cover_path,
+        sample_rate,
+        default_gap_seconds,
+    )
+}
+
+#[command]
+pub fn library_update_album(
+    album_id: i64,
+    name: String,
+    description: String,
+    cover_path: Option<String>,
+    sample_rate: u32,
+    default_gap_seconds: f64,
+    db: State<'_, LibraryDb>,
+) -> Result<Album, String> {
+    let connection = db.0.lock().map_err(|e| e.to_string())?;
+    update_album(
+        &connection,
+        album_id,
+        &name,
+        &description,
+        cover_path,
+        sample_rate,
+        default_gap_seconds,
+    )
+}
+
+#[command]
+pub fn library_delete_album(album_id: i64, db: State<'_, LibraryDb>) -> Result<(), String> {
+    let connection = db.0.lock().map_err(|e| e.to_string())?;
+    delete_album(&connection, album_id)
+}
+
+#[command]
+pub fn library_add_album_track(
+    album_id: i64,
+    track_id: i64,
+    db: State<'_, LibraryDb>,
+) -> Result<Album, String> {
+    let connection = db.0.lock().map_err(|e| e.to_string())?;
+    add_album_track(&connection, album_id, track_id)
+}
+
+#[command]
+pub fn library_update_album_track(
+    item_id: i64,
+    settings: AlbumTrackSettings,
+    db: State<'_, LibraryDb>,
+) -> Result<Album, String> {
+    let connection = db.0.lock().map_err(|e| e.to_string())?;
+    update_album_track(&connection, item_id, &settings)
+}
+
+#[command]
+pub fn library_remove_album_track(item_id: i64, db: State<'_, LibraryDb>) -> Result<Album, String> {
+    let mut connection = db.0.lock().map_err(|e| e.to_string())?;
+    remove_album_track(&mut connection, item_id)
+}
+
+#[command]
+pub fn library_reorder_album_tracks(
+    album_id: i64,
+    item_ids: Vec<i64>,
+    db: State<'_, LibraryDb>,
+) -> Result<Album, String> {
+    let mut connection = db.0.lock().map_err(|e| e.to_string())?;
+    reorder_album_tracks(&mut connection, album_id, &item_ids)
 }
 
 #[cfg(test)]
@@ -616,7 +1198,7 @@ mod tests {
         let restored = list_tracks(&connection).unwrap().remove(0);
         assert_eq!(restored.settings, settings);
 
-        delete_track(&connection, imported.id).unwrap();
+        delete_track(&mut connection, imported.id).unwrap();
         assert!(
             source.exists(),
             "deleting a Track must not delete its source"
@@ -652,5 +1234,57 @@ mod tests {
         assert!(list_tracks(&connection).unwrap()[0].tags.is_empty());
         assert_eq!(list_tracks(&connection).unwrap().len(), 1);
         std::fs::remove_file(source).unwrap();
+    }
+
+    #[test]
+    fn manages_album_tracks_with_independent_settings_and_order() {
+        let mut connection = memory_db();
+        let source_a = source_fixture("album-a");
+        let source_b = source_fixture("album-b");
+        let track_a = import_track(&mut connection, &source_a.to_string_lossy()).unwrap();
+        let track_b = import_track(&mut connection, &source_b.to_string_lossy()).unwrap();
+        let album_tag = create_tag(&connection, "Album tag", "#ABCDEF").unwrap();
+        set_track_tag(&connection, track_a.id, album_tag.id, true).unwrap();
+        let album =
+            create_album(&connection, "Night Walk", "Two tracks", None, 48_000, 1.5).unwrap();
+
+        let album = add_album_track(&connection, album.summary.id, track_a.id).unwrap();
+        let album = add_album_track(&connection, album.summary.id, track_b.id).unwrap();
+        assert_eq!(album.tracks.len(), 2);
+        assert_eq!(album.tracks[0].settings.gap_after_seconds, 1.5);
+        assert_eq!(album.summary.tags[0].name, "Album tag");
+
+        let first_id = album.tracks[0].id;
+        let second_id = album.tracks[1].id;
+        let custom = AlbumTrackSettings {
+            range_mode: "manual".to_string(),
+            start_cycle: 2.0,
+            end_cycle: 6.0,
+            loops: 4,
+            max_polyphony: 64,
+            gap_after_seconds: 0.5,
+        };
+        let album = update_album_track(&connection, first_id, &custom).unwrap();
+        assert_eq!(album.tracks[0].settings, custom);
+        assert_eq!(
+            find_track(&connection, track_a.id).unwrap().settings.loops,
+            1
+        );
+
+        let album = reorder_album_tracks(&mut connection, album.summary.id, &[second_id, first_id])
+            .unwrap();
+        assert_eq!(album.tracks[0].track.id, track_b.id);
+
+        let album = remove_album_track(&mut connection, second_id).unwrap();
+        assert_eq!(album.tracks.len(), 1);
+        assert_eq!(album.tracks[0].position, 0);
+
+        delete_track(&mut connection, track_a.id).unwrap();
+        assert!(find_album(&connection, album.summary.id).unwrap().tracks.is_empty());
+
+        delete_album(&connection, album.summary.id).unwrap();
+        assert_eq!(list_tracks(&connection).unwrap().len(), 1);
+        std::fs::remove_file(source_a).unwrap();
+        std::fs::remove_file(source_b).unwrap();
     }
 }
