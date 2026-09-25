@@ -12,11 +12,19 @@ export interface SavedTrackSettings {
   exportFileName: string
 }
 
+export interface LibraryTag {
+  id: number
+  name: string
+  color: string
+  trackCount: number
+}
+
 export interface LibraryTrack {
   id: number
   name: string
   sourcePath: string
   settings: SavedTrackSettings
+  tags: LibraryTag[]
   createdAt: number
   updatedAt: number
 }
@@ -38,4 +46,24 @@ export function saveTrackSettings(
 
 export function deleteTrack(trackId: number): Promise<void> {
   return invoke('library_delete_track', { trackId })
+}
+
+export function listTags(): Promise<LibraryTag[]> {
+  return invoke('library_list_tags')
+}
+
+export function createTag(name: string, color: string): Promise<LibraryTag> {
+  return invoke('library_create_tag', { name, color })
+}
+
+export function updateTag(tagId: number, name: string, color: string): Promise<LibraryTag> {
+  return invoke('library_update_tag', { tagId, name, color })
+}
+
+export function deleteTag(tagId: number): Promise<void> {
+  return invoke('library_delete_tag', { tagId })
+}
+
+export function setTrackTag(trackId: number, tagId: number, attached: boolean): Promise<LibraryTrack> {
+  return invoke('library_set_track_tag', { trackId, tagId, attached })
 }

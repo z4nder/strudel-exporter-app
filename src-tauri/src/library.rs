@@ -21,11 +21,21 @@ pub struct TrackRenderSettings {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
+pub struct Tag {
+    pub id: i64,
+    pub name: String,
+    pub color: String,
+    pub track_count: u32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
 pub struct Track {
     pub id: i64,
     pub name: String,
     pub source_path: String,
     pub settings: TrackRenderSettings,
+    pub tags: Vec<Tag>,
     pub created_at: i64,
     pub updated_at: i64,
 }
@@ -114,6 +124,18 @@ pub fn migrate(connection: &Connection) -> Result<(), String> {
                max_polyphony INTEGER NOT NULL CHECK(max_polyphony BETWEEN 1 AND 256),
                export_file_name TEXT NOT NULL,
                updated_at INTEGER NOT NULL
+             );
+             CREATE TABLE IF NOT EXISTS tags (
+               id INTEGER PRIMARY KEY AUTOINCREMENT,
+               name TEXT NOT NULL COLLATE NOCASE UNIQUE,
+               color TEXT NOT NULL,
+               created_at INTEGER NOT NULL,
+               updated_at INTEGER NOT NULL
+             );
+             CREATE TABLE IF NOT EXISTS track_tags (
+               track_id INTEGER NOT NULL REFERENCES tracks(id) ON DELETE CASCADE,
+               tag_id INTEGER NOT NULL REFERENCES tags(id) ON DELETE CASCADE,
+               PRIMARY KEY(track_id, tag_id)
              );",
         )
         .map_err(|e| e.to_string())
@@ -135,6 +157,7 @@ fn row_to_track(row: &rusqlite::Row<'_>) -> rusqlite::Result<Track> {
             max_polyphony: row.get(10)?,
             export_file_name: row.get(11)?,
         },
+        tags: Vec::new(),
     })
 }
 
@@ -145,7 +168,7 @@ const TRACK_SELECT: &str = "SELECT t.id, t.name, t.source_path, t.created_at, t.
        JOIN track_render_settings s ON s.track_id = t.id";
 
 fn find_track(connection: &Connection, id: i64) -> Result<Track, String> {
-    connection
+    let mut track = connection
         .query_row(
             &format!("{TRACK_SELECT} WHERE t.id = ?1"),
             [id],
@@ -153,7 +176,147 @@ fn find_track(connection: &Connection, id: i64) -> Result<Track, String> {
         )
         .optional()
         .map_err(|e| e.to_string())?
-        .ok_or_else(|| "Track não encontrada".to_string())
+        .ok_or_else(|| "Track não encontrada".to_string())?;
+    track.tags = tags_for_track(connection, track.id)?;
+    Ok(track)
+}
+
+fn row_to_tag(row: &rusqlite::Row<'_>) -> rusqlite::Result<Tag> {
+    Ok(Tag {
+        id: row.get(0)?,
+        name: row.get(1)?,
+        color: row.get(2)?,
+        track_count: row.get(3)?,
+    })
+}
+
+const TAG_SELECT: &str = "SELECT g.id, g.name, g.color,
+            CAST((SELECT COUNT(*) FROM track_tags tt WHERE tt.tag_id = g.id) AS INTEGER)
+       FROM tags g";
+
+fn tags_for_track(connection: &Connection, track_id: i64) -> Result<Vec<Tag>, String> {
+    let mut statement = connection
+        .prepare(&format!(
+            "{TAG_SELECT} JOIN track_tags link ON link.tag_id = g.id
+             WHERE link.track_id = ?1 ORDER BY g.name COLLATE NOCASE"
+        ))
+        .map_err(|e| e.to_string())?;
+    let tags = statement
+        .query_map([track_id], row_to_tag)
+        .map_err(|e| e.to_string())?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| e.to_string())?;
+    Ok(tags)
+}
+
+fn list_tags(connection: &Connection) -> Result<Vec<Tag>, String> {
+    let mut statement = connection
+        .prepare(&format!("{TAG_SELECT} ORDER BY g.name COLLATE NOCASE"))
+        .map_err(|e| e.to_string())?;
+    let tags = statement
+        .query_map([], row_to_tag)
+        .map_err(|e| e.to_string())?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| e.to_string())?;
+    Ok(tags)
+}
+
+fn validate_tag(name: &str, color: &str) -> Result<(String, String), String> {
+    let name = name.trim();
+    if name.is_empty() || name.chars().count() > 40 {
+        return Err("o nome da tag deve ter entre 1 e 40 caracteres".to_string());
+    }
+    let valid_color = color.len() == 7
+        && color.starts_with('#')
+        && color[1..]
+            .chars()
+            .all(|character| character.is_ascii_hexdigit());
+    if !valid_color {
+        return Err("a cor deve usar o formato hexadecimal #RRGGBB".to_string());
+    }
+    Ok((name.to_string(), color.to_ascii_uppercase()))
+}
+
+fn create_tag(connection: &Connection, name: &str, color: &str) -> Result<Tag, String> {
+    let (name, color) = validate_tag(name, color)?;
+    let now = now_timestamp();
+    connection
+        .execute(
+            "INSERT INTO tags(name, color, created_at, updated_at) VALUES (?1, ?2, ?3, ?3)",
+            params![name, color, now],
+        )
+        .map_err(|error| {
+            if error.to_string().contains("UNIQUE constraint failed") {
+                "já existe uma tag com esse nome".to_string()
+            } else {
+                error.to_string()
+            }
+        })?;
+    let id = connection.last_insert_rowid();
+    Ok(Tag {
+        id,
+        name,
+        color,
+        track_count: 0,
+    })
+}
+
+fn update_tag(connection: &Connection, id: i64, name: &str, color: &str) -> Result<Tag, String> {
+    let (name, color) = validate_tag(name, color)?;
+    let changed = connection
+        .execute(
+            "UPDATE tags SET name = ?1, color = ?2, updated_at = ?3 WHERE id = ?4",
+            params![name, color, now_timestamp(), id],
+        )
+        .map_err(|error| {
+            if error.to_string().contains("UNIQUE constraint failed") {
+                "já existe uma tag com esse nome".to_string()
+            } else {
+                error.to_string()
+            }
+        })?;
+    if changed == 0 {
+        return Err("Tag não encontrada".to_string());
+    }
+    list_tags(connection)?
+        .into_iter()
+        .find(|tag| tag.id == id)
+        .ok_or_else(|| "Tag não encontrada".to_string())
+}
+
+fn delete_tag(connection: &Connection, id: i64) -> Result<(), String> {
+    let changed = connection
+        .execute("DELETE FROM tags WHERE id = ?1", [id])
+        .map_err(|e| e.to_string())?;
+    if changed == 0 {
+        return Err("Tag não encontrada".to_string());
+    }
+    Ok(())
+}
+
+fn set_track_tag(
+    connection: &Connection,
+    track_id: i64,
+    tag_id: i64,
+    attached: bool,
+) -> Result<Track, String> {
+    find_track(connection, track_id)?;
+    if attached {
+        connection
+            .execute(
+                "INSERT OR IGNORE INTO track_tags(track_id, tag_id) VALUES (?1, ?2)",
+                params![track_id, tag_id],
+            )
+            .map_err(|e| e.to_string())?;
+    } else {
+        connection
+            .execute(
+                "DELETE FROM track_tags WHERE track_id = ?1 AND tag_id = ?2",
+                params![track_id, tag_id],
+            )
+            .map_err(|e| e.to_string())?;
+    }
+    find_track(connection, track_id)
 }
 
 fn list_tracks(connection: &Connection) -> Result<Vec<Track>, String> {
@@ -167,6 +330,10 @@ fn list_tracks(connection: &Connection) -> Result<Vec<Track>, String> {
         .map_err(|e| e.to_string())?
         .collect::<Result<Vec<_>, _>>()
         .map_err(|e| e.to_string())?;
+    let mut tracks = tracks;
+    for track in &mut tracks {
+        track.tags = tags_for_track(connection, track.id)?;
+    }
     Ok(tracks)
 }
 
@@ -304,6 +471,50 @@ pub fn library_delete_track(track_id: i64, db: State<'_, LibraryDb>) -> Result<(
     delete_track(&connection, track_id)
 }
 
+#[command]
+pub fn library_list_tags(db: State<'_, LibraryDb>) -> Result<Vec<Tag>, String> {
+    let connection = db.0.lock().map_err(|e| e.to_string())?;
+    list_tags(&connection)
+}
+
+#[command]
+pub fn library_create_tag(
+    name: String,
+    color: String,
+    db: State<'_, LibraryDb>,
+) -> Result<Tag, String> {
+    let connection = db.0.lock().map_err(|e| e.to_string())?;
+    create_tag(&connection, &name, &color)
+}
+
+#[command]
+pub fn library_update_tag(
+    tag_id: i64,
+    name: String,
+    color: String,
+    db: State<'_, LibraryDb>,
+) -> Result<Tag, String> {
+    let connection = db.0.lock().map_err(|e| e.to_string())?;
+    update_tag(&connection, tag_id, &name, &color)
+}
+
+#[command]
+pub fn library_delete_tag(tag_id: i64, db: State<'_, LibraryDb>) -> Result<(), String> {
+    let connection = db.0.lock().map_err(|e| e.to_string())?;
+    delete_tag(&connection, tag_id)
+}
+
+#[command]
+pub fn library_set_track_tag(
+    track_id: i64,
+    tag_id: i64,
+    attached: bool,
+    db: State<'_, LibraryDb>,
+) -> Result<Track, String> {
+    let connection = db.0.lock().map_err(|e| e.to_string())?;
+    set_track_tag(&connection, track_id, tag_id, attached)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -411,6 +622,35 @@ mod tests {
             "deleting a Track must not delete its source"
         );
         assert!(list_tracks(&connection).unwrap().is_empty());
+        std::fs::remove_file(source).unwrap();
+    }
+
+    #[test]
+    fn manages_tags_and_track_links_without_duplicates() {
+        let mut connection = memory_db();
+        let source = source_fixture("tags");
+        let track = import_track(&mut connection, &source.to_string_lossy()).unwrap();
+
+        let ambient = create_tag(&connection, "Ambient", "#4F8A67").unwrap();
+        assert!(create_tag(&connection, "ambient", "#FFFFFF").is_err());
+        assert!(create_tag(&connection, "Invalid", "white").is_err());
+
+        let attached = set_track_tag(&connection, track.id, ambient.id, true).unwrap();
+        assert_eq!(attached.tags.len(), 1);
+        assert_eq!(attached.tags[0].name, "Ambient");
+        set_track_tag(&connection, track.id, ambient.id, true).unwrap();
+        assert_eq!(list_tags(&connection).unwrap()[0].track_count, 1);
+
+        let updated = update_tag(&connection, ambient.id, "Atmosphere", "#123ABC").unwrap();
+        assert_eq!(updated.name, "Atmosphere");
+        assert_eq!(
+            list_tracks(&connection).unwrap()[0].tags[0].color,
+            "#123ABC"
+        );
+
+        delete_tag(&connection, ambient.id).unwrap();
+        assert!(list_tracks(&connection).unwrap()[0].tags.is_empty());
+        assert_eq!(list_tracks(&connection).unwrap().len(), 1);
         std::fs::remove_file(source).unwrap();
     }
 }

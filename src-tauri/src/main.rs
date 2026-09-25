@@ -125,6 +125,11 @@ fn main() {
             library::library_import_track,
             library::library_save_track_settings,
             library::library_delete_track,
+            library::library_list_tags,
+            library::library_create_tag,
+            library::library_update_tag,
+            library::library_delete_tag,
+            library::library_set_track_tag,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

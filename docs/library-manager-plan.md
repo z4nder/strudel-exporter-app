@@ -1,8 +1,8 @@
 # Plano — Strudel Library Manager
 
-Status: em implementação. A Fase 1 já possui SQLite, migration inicial,
-importação/listagem/remoção de Tracks e persistência da configuração de render.
-Tags e Albums permanecem nas fases seguintes.
+Status: em implementação. As fases de fundação, biblioteca de Tracks e Tags já
+possuem SQLite, CRUD, configuração persistida, badges e filtros. Albums permanece
+na fase seguinte.
 
 Este documento descreve a evolução do exportador atual para uma biblioteca
 local de Tracks e Albums. O renderizador Strudel, a detecção de round, o cache
@@ -440,18 +440,18 @@ Critério: importar, fechar, reabrir e recuperar Track e configuração.
 
 ### Fase 2 — Biblioteca de Tracks
 
-- listagem, busca e detalhe;
-- salvar configuração padrão;
-- preview temporário e export pelo diálogo de destino.
+- [x] listagem, busca e detalhe;
+- [x] salvar configuração padrão;
+- [x] preview temporário e export pelo diálogo de destino.
 
 Critério: o fluxo atual funciona a partir de qualquer Track cadastrada.
 
 ### Fase 3 — Tags
 
-- CRUD de tags;
-- attach/detach N:N;
-- badges e filtros;
-- proteção ao excluir tags em uso.
+- [x] CRUD de tags;
+- [x] attach/detach N:N;
+- [x] badges e filtros;
+- [x] confirmação ao excluir tags em uso.
 
 Critério: filtros continuam corretos após editar ou excluir uma tag.
 

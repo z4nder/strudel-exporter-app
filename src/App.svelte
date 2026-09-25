@@ -5,10 +5,16 @@
   import { formatDuration, type StrudelMeta } from './lib/loop-parser'
   import { analyzeStrudel, renderToUrl, exportToWav, type RenderSettings } from './lib/strudel-runner'
   import {
+    createTag,
+    deleteTag,
     deleteTrack as deleteLibraryTrack,
     importTrack as importLibraryTrack,
+    listTags,
     listTracks,
     saveTrackSettings,
+    setTrackTag,
+    updateTag,
+    type LibraryTag,
     type LibraryTrack,
     type SavedTrackSettings,
   } from './lib/library'
@@ -28,6 +34,16 @@
   let saveMessage = $state('')
   let trackPendingDelete = $state<LibraryTrack | null>(null)
   let deletingTrack = $state(false)
+  let tags = $state<LibraryTag[]>([])
+  let selectedTagIds = $state<number[]>([])
+  let tagManagerOpen = $state(false)
+  let tagFormName = $state('')
+  let tagFormColor = $state('#C8861E')
+  let editingTagId = $state<number | null>(null)
+  let tagSaving = $state(false)
+  let tagError = $state('')
+  let tagPendingDelete = $state<LibraryTag | null>(null)
+  let tagLinkSavingId = $state<number | null>(null)
 
   let filePath = $state('')
   let fileContent = $state('')
@@ -63,7 +79,9 @@
   let visibleTracks = $derived(
     tracks.filter((track) => {
       const query = trackSearch.trim().toLocaleLowerCase()
-      return !query || track.name.toLocaleLowerCase().includes(query) || track.sourcePath.toLocaleLowerCase().includes(query)
+      const matchesQuery = !query || track.name.toLocaleLowerCase().includes(query) || track.sourcePath.toLocaleLowerCase().includes(query)
+      const matchesTags = selectedTagIds.every((tagId) => track.tags.some((tag) => tag.id === tagId))
+      return matchesQuery && matchesTags
     }),
   )
   let settingsDirty = $derived(activeTrackId !== null && savedSettingsKey !== serializedSettings())
@@ -75,7 +93,10 @@
   async function refreshTracks() {
     libraryLoading = true
     try {
-      tracks = await listTracks()
+      const [loadedTracks, loadedTags] = await Promise.all([listTracks(), listTags()])
+      tracks = loadedTracks
+      tags = loadedTags
+      selectedTagIds = selectedTagIds.filter((tagId) => loadedTags.some((tag) => tag.id === tagId))
       libraryError = ''
     } catch (err) {
       libraryError = `Erro ao carregar biblioteca: ${err}`
@@ -277,6 +298,16 @@
     if (!deletingTrack) trackPendingDelete = null
   }
 
+  function handleEscape() {
+    if (tagPendingDelete && !tagSaving) {
+      tagPendingDelete = null
+    } else if (tagManagerOpen) {
+      closeTagManager()
+    } else {
+      cancelTrackRemoval()
+    }
+  }
+
   async function confirmTrackRemoval() {
     if (!trackPendingDelete || deletingTrack) return
     deletingTrack = true
@@ -294,6 +325,91 @@
   function formatLibraryDate(timestamp: number) {
     return new Intl.DateTimeFormat('pt-BR', { dateStyle: 'short', timeStyle: 'short' })
       .format(new Date(timestamp * 1000))
+  }
+
+  function toggleTagFilter(tagId: number) {
+    selectedTagIds = selectedTagIds.includes(tagId)
+      ? selectedTagIds.filter((id) => id !== tagId)
+      : [...selectedTagIds, tagId]
+  }
+
+  function openTagManager() {
+    tagManagerOpen = true
+    tagError = ''
+    resetTagForm()
+  }
+
+  function closeTagManager() {
+    if (tagSaving) return
+    tagManagerOpen = false
+    tagPendingDelete = null
+    resetTagForm()
+  }
+
+  function resetTagForm() {
+    editingTagId = null
+    tagFormName = ''
+    tagFormColor = '#C8861E'
+  }
+
+  function editTag(tag: LibraryTag) {
+    editingTagId = tag.id
+    tagFormName = tag.name
+    tagFormColor = tag.color
+    tagError = ''
+  }
+
+  async function submitTag() {
+    if (tagSaving) return
+    tagSaving = true
+    tagError = ''
+    try {
+      if (editingTagId === null) {
+        await createTag(tagFormName, tagFormColor)
+      } else {
+        await updateTag(editingTagId, tagFormName, tagFormColor)
+      }
+      resetTagForm()
+      await refreshTracks()
+    } catch (err) {
+      tagError = String(err)
+    } finally {
+      tagSaving = false
+    }
+  }
+
+  async function confirmTagRemoval() {
+    if (!tagPendingDelete || tagSaving) return
+    tagSaving = true
+    tagError = ''
+    try {
+      await deleteTag(tagPendingDelete.id)
+      tagPendingDelete = null
+      resetTagForm()
+      await refreshTracks()
+    } catch (err) {
+      tagError = String(err)
+    } finally {
+      tagSaving = false
+    }
+  }
+
+  async function toggleActiveTrackTag(tag: LibraryTag) {
+    if (activeTrackId === null || tagLinkSavingId !== null) return
+    const activeTrack = tracks.find((track) => track.id === activeTrackId)
+    if (!activeTrack) return
+    const attached = activeTrack.tags.some((item) => item.id === tag.id)
+    tagLinkSavingId = tag.id
+    try {
+      const updated = await setTrackTag(activeTrackId, tag.id, !attached)
+      tracks = tracks.map((track) => track.id === updated.id ? updated : track)
+      tags = await listTags()
+    } catch (err) {
+      errorMsg = `Erro ao atualizar Tag: ${err}`
+      appStatus = 'error'
+    } finally {
+      tagLinkSavingId = null
+    }
   }
 
   function cancelGeneration() {
@@ -452,7 +568,7 @@
   ></audio>
 {/if}
 
-<svelte:window onkeydown={(event) => event.key === 'Escape' && cancelTrackRemoval()} />
+<svelte:window onkeydown={(event) => event.key === 'Escape' && handleEscape()} />
 
 <main>
   <header>
@@ -462,7 +578,7 @@
     </div>
     {#if screen === 'library'}
       <div class="header-actions">
-        <button class="btn-tags" type="button" disabled title="Será implementado na próxima fase">Tags</button>
+        <button class="btn-tags" type="button" onclick={openTagManager}>Tags</button>
         <button class="btn-import" type="button" onclick={pickFile}>+ Importar Track</button>
       </div>
     {:else}
@@ -486,6 +602,25 @@
           <input bind:value={trackSearch} type="search" placeholder="Buscar por nome ou caminho…" aria-label="Buscar Tracks" />
           <span>{visibleTracks.length} {visibleTracks.length === 1 ? 'Track' : 'Tracks'}</span>
         </div>
+
+        {#if tags.length > 0}
+          <div class="tag-filters" aria-label="Filtrar por tags">
+            <span>Filtrar:</span>
+            {#each tags as tag (tag.id)}
+              <button
+                type="button"
+                class:active={selectedTagIds.includes(tag.id)}
+                style={`--tag-color: ${tag.color}`}
+                onclick={() => toggleTagFilter(tag.id)}
+              >
+                <i></i>{tag.name} <small>{tag.trackCount}</small>
+              </button>
+            {/each}
+            {#if selectedTagIds.length > 0}
+              <button class="clear-tags" type="button" onclick={() => selectedTagIds = []}>Limpar</button>
+            {/if}
+          </div>
+        {/if}
 
         {#if libraryLoading}
           <div class="library-state"><span class="spinner"></span> Carregando biblioteca…</div>
@@ -522,6 +657,13 @@
                 <div class="track-card-body">
                   <strong>{track.name}</strong>
                   <span class="track-path">{track.sourcePath}</span>
+                  {#if track.tags.length > 0}
+                    <div class="track-badges">
+                      {#each track.tags as tag (tag.id)}
+                        <span style={`--tag-color: ${tag.color}`}><i></i>{tag.name}</span>
+                      {/each}
+                    </div>
+                  {/if}
                   <div class="track-card-meta">
                     <span>{track.settings.endCycle - track.settings.startCycle} cycles</span>
                     <span>{track.settings.loops}× loop</span>
@@ -578,6 +720,27 @@
           </div>
         </div>
       {/if}
+      <div class="track-tags-editor">
+        <span class="track-tags-label">Tags</span>
+        {#if tags.length === 0}
+          <button type="button" class="create-first-tag" onclick={openTagManager}>Criar primeira Tag</button>
+        {:else}
+          <div class="track-tag-options">
+            {#each tags as tag (tag.id)}
+              {@const attached = tracks.find((track) => track.id === activeTrackId)?.tags.some((item) => item.id === tag.id) ?? false}
+              <button
+                type="button"
+                class:attached
+                style={`--tag-color: ${tag.color}`}
+                disabled={isBusy || tagLinkSavingId !== null}
+                onclick={() => toggleActiveTrackTag(tag)}
+              >
+                <i></i>{tag.name}{attached ? ' ×' : ' +'}
+              </button>
+            {/each}
+          </div>
+        {/if}
+      </div>
     </div>
 
     <section class="controls">
@@ -843,6 +1006,77 @@
   </div>
 {/if}
 
+{#if tagManagerOpen}
+  <div class="modal-backdrop">
+    <button class="modal-dismiss" type="button" onclick={closeTagManager} aria-label="Fechar gerenciador de Tags"></button>
+    <div class="confirm-modal tag-modal" role="dialog" aria-modal="true" aria-labelledby="tag-manager-title">
+      {#if tagPendingDelete}
+        <div class="modal-icon" aria-hidden="true">×</div>
+        <div class="modal-copy">
+          <h2 id="tag-manager-title">Excluir Tag?</h2>
+          <p>
+            A Tag <strong>{tagPendingDelete.name}</strong> será removida de {tagPendingDelete.trackCount}
+            {tagPendingDelete.trackCount === 1 ? ' Track' : ' Tracks'}.
+          </p>
+          <p class="modal-note">Nenhuma Track ou arquivo será excluído.</p>
+        </div>
+        <div class="modal-actions">
+          <button class="modal-cancel" type="button" onclick={() => tagPendingDelete = null} disabled={tagSaving}>Cancelar</button>
+          <button class="modal-confirm" type="button" onclick={confirmTagRemoval} disabled={tagSaving}>
+            {tagSaving ? 'Excluindo…' : 'Excluir Tag'}
+          </button>
+        </div>
+      {:else}
+        <div class="tag-modal-header">
+          <div>
+            <h2 id="tag-manager-title">Gerenciar Tags</h2>
+            <p>Nomes, cores e uso nas Tracks.</p>
+          </div>
+          <button type="button" onclick={closeTagManager} aria-label="Fechar">×</button>
+        </div>
+
+        <form class="tag-form" onsubmit={(event) => { event.preventDefault(); void submitTag() }}>
+          <label>
+            <span>Nome</span>
+            <input bind:value={tagFormName} maxlength="40" placeholder="Ex.: Ambient" disabled={tagSaving} />
+          </label>
+          <label class="tag-color-field">
+            <span>Cor</span>
+            <div>
+              <input type="color" bind:value={tagFormColor} disabled={tagSaving} />
+              <code>{tagFormColor.toUpperCase()}</code>
+            </div>
+          </label>
+          <button class="tag-submit" type="submit" disabled={tagSaving || !tagFormName.trim()}>
+            {tagSaving ? 'Salvando…' : editingTagId === null ? 'Criar Tag' : 'Salvar Tag'}
+          </button>
+          {#if editingTagId !== null}
+            <button class="tag-form-cancel" type="button" onclick={resetTagForm} disabled={tagSaving}>Cancelar edição</button>
+          {/if}
+        </form>
+
+        {#if tagError}<div class="tag-error">{tagError}</div>{/if}
+
+        <div class="tag-list">
+          {#if tags.length === 0}
+            <p class="tag-list-empty">Nenhuma Tag criada.</p>
+          {:else}
+            {#each tags as tag (tag.id)}
+              <div class="tag-list-item">
+                <i style={`--tag-color: ${tag.color}`}></i>
+                <div><strong>{tag.name}</strong><span>{tag.trackCount} {tag.trackCount === 1 ? 'Track' : 'Tracks'}</span></div>
+                <code>{tag.color}</code>
+                <button type="button" onclick={() => editTag(tag)}>Editar</button>
+                <button class="tag-remove" type="button" onclick={() => tagPendingDelete = tag}>Excluir</button>
+              </div>
+            {/each}
+          {/if}
+        </div>
+      {/if}
+    </div>
+  </div>
+{/if}
+
 <style>
   :global(*, *::before, *::after) { box-sizing: border-box; margin: 0; padding: 0; }
   :global(body) {
@@ -904,6 +1138,23 @@
   }
   .library-toolbar input:focus { border-color: #c8861e; }
   .library-toolbar > span { color: #45455a; font: 11px 'JetBrains Mono', monospace; white-space: nowrap; }
+  .tag-filters { display: flex; align-items: center; flex-wrap: wrap; gap: 7px; }
+  .tag-filters > span { margin-right: 2px; color: #46465a; font-size: 11px; }
+  .tag-filters button, .track-badges span, .track-tag-options button {
+    --tag-color: #c8861e;
+    display: inline-flex; align-items: center; gap: 5px; padding: 4px 7px;
+    background: color-mix(in srgb, var(--tag-color) 9%, #131320);
+    color: color-mix(in srgb, var(--tag-color) 78%, #ddd);
+    border: 1px solid color-mix(in srgb, var(--tag-color) 28%, #29293a);
+    border-radius: 999px; font: 10px 'Space Grotesk', sans-serif;
+  }
+  .tag-filters button { cursor: pointer; opacity: 0.7; }
+  .tag-filters button.active { opacity: 1; background: color-mix(in srgb, var(--tag-color) 20%, #131320); }
+  .tag-filters button i, .track-badges i, .track-tag-options i {
+    width: 6px; height: 6px; border-radius: 50%; background: var(--tag-color);
+  }
+  .tag-filters button small { color: inherit; opacity: 0.55; font-size: 9px; }
+  .tag-filters .clear-tags { --tag-color: #77778c; background: transparent; }
   .library-state { flex: 1; display: flex; align-items: center; justify-content: center; gap: 9px; color: #5e5e73; font-size: 13px; }
   .library-empty { min-height: 300px; }
   .track-grid {
@@ -928,6 +1179,8 @@
     overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
     color: #4b4b60; font: 10px 'JetBrains Mono', monospace;
   }
+  .track-badges { display: flex; flex-wrap: wrap; gap: 5px; }
+  .track-badges span { padding: 3px 6px; }
   .track-card-meta { display: flex; flex-wrap: wrap; gap: 5px 10px; color: #67677c; font-size: 10px; }
   .track-delete {
     align-self: flex-start; flex: 0 0 auto; width: 24px; height: 24px;
@@ -1012,6 +1265,16 @@
   .meta-val { font-family: 'JetBrains Mono', monospace; font-size: 14px; font-weight: 500; color: #c8861e; }
   .meta-label { font-size: 12px; color: #50506a; }
   .meta-sep { color: #2a2a3a; font-size: 16px; }
+  .track-tags-editor { display: flex; align-items: flex-start; gap: 9px; }
+  .track-tags-label { padding-top: 4px; color: #4c4c61; font-size: 11px; }
+  .track-tag-options { display: flex; flex-wrap: wrap; gap: 6px; }
+  .track-tag-options button { cursor: pointer; opacity: 0.55; }
+  .track-tag-options button.attached { opacity: 1; background: color-mix(in srgb, var(--tag-color) 18%, #131320); }
+  .track-tag-options button:disabled { cursor: wait; }
+  .create-first-tag {
+    padding: 4px 7px; background: transparent; color: #9a6b25;
+    border: 1px dashed #60461f; border-radius: 6px; cursor: pointer; font-size: 10px;
+  }
 
   /* ── Controls ── */
   .controls { display: flex; flex-direction: column; gap: 14px; }
@@ -1308,6 +1571,60 @@
   .modal-confirm { background: #b94f4f; color: #fff; border: 1px solid #c75a5a; }
   .modal-confirm:hover:not(:disabled) { background: #ca5858; }
   .modal-actions button:disabled { opacity: 0.5; cursor: wait; }
+
+  .tag-modal { width: min(620px, 100%); max-height: min(720px, calc(100vh - 48px)); overflow-y: auto; }
+  .tag-modal-header { display: flex; align-items: flex-start; justify-content: space-between; gap: 16px; }
+  .tag-modal-header h2 { color: #e0dcd4; font-size: 18px; }
+  .tag-modal-header p { margin-top: 4px; color: #59596e; font-size: 12px; }
+  .tag-modal-header > button {
+    background: transparent; color: #606076; border: 0; cursor: pointer; font-size: 21px;
+  }
+  .tag-form {
+    display: grid; grid-template-columns: minmax(0, 1fr) 130px auto; gap: 9px; align-items: end;
+    margin-top: 18px; padding: 13px; background: #101019; border: 1px solid #232333; border-radius: 8px;
+  }
+  .tag-form label { display: flex; flex-direction: column; gap: 6px; }
+  .tag-form label > span { color: #55556a; font-size: 10px; }
+  .tag-form input:not([type='color']) {
+    width: 100%; height: 35px; padding: 7px 9px;
+    background: #181826; color: #d8d4cb; border: 1px solid #2b2b3d; border-radius: 6px;
+    outline: none; font: 12px 'Space Grotesk', sans-serif;
+  }
+  .tag-form input:focus { border-color: #c8861e; }
+  .tag-color-field > div { display: flex; align-items: center; height: 35px; gap: 7px; }
+  .tag-color-field input[type='color'] {
+    width: 38px; height: 35px; padding: 3px; background: #181826; border: 1px solid #2b2b3d; border-radius: 6px;
+  }
+  .tag-color-field code { color: #77778c; font: 10px 'JetBrains Mono', monospace; }
+  .tag-submit, .tag-form-cancel {
+    height: 35px; padding: 0 11px; border-radius: 6px; cursor: pointer;
+    font: 500 11px 'Space Grotesk', sans-serif;
+  }
+  .tag-submit { background: #c8861e; color: #0c0c12; border: 0; }
+  .tag-submit:disabled { opacity: 0.4; cursor: not-allowed; }
+  .tag-form-cancel { grid-column: 3; background: transparent; color: #77778c; border: 1px solid #333345; }
+  .tag-error {
+    margin-top: 9px; padding: 8px 10px; color: #d67575; background: rgba(200, 80, 80, 0.08);
+    border-radius: 6px; font-size: 11px;
+  }
+  .tag-list { display: flex; flex-direction: column; gap: 6px; margin-top: 14px; }
+  .tag-list-empty { padding: 28px; text-align: center; color: #505064; font-size: 12px; }
+  .tag-list-item {
+    display: grid; grid-template-columns: 10px minmax(0, 1fr) auto auto auto;
+    align-items: center; gap: 10px; padding: 9px 10px;
+    background: #11111b; border: 1px solid #20202f; border-radius: 7px;
+  }
+  .tag-list-item > i { width: 9px; height: 9px; border-radius: 50%; background: var(--tag-color); }
+  .tag-list-item > div { display: flex; flex-direction: column; gap: 2px; }
+  .tag-list-item strong { color: #c9c5bc; font-size: 12px; }
+  .tag-list-item span { color: #4f4f63; font-size: 10px; }
+  .tag-list-item code { color: #606075; font: 10px 'JetBrains Mono', monospace; }
+  .tag-list-item button {
+    padding: 5px 7px; background: transparent; color: #77778b;
+    border: 1px solid #303041; border-radius: 5px; cursor: pointer; font-size: 10px;
+  }
+  .tag-list-item button:hover { color: #c8861e; border-color: #674b23; }
+  .tag-list-item .tag-remove:hover { color: #d06b6b; border-color: #663838; }
 
   @media (prefers-reduced-motion: reduce) {
     .spinner { animation: none; }
