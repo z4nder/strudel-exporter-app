@@ -1,5 +1,12 @@
 import { mockIPC } from '@tauri-apps/api/mocks'
-import { analyzeStrudel, exportToWav, renderToUrl } from '../../src/lib/strudel-runner'
+import { analyzeStrudel, exportToWav, renderToUrl, type RenderSettings } from '../../src/lib/strudel-runner'
+
+const automaticSettings: RenderSettings = {
+  startCycle: 0,
+  endCycle: 8,
+  sampleRate: 44100,
+  maxPolyphony: 32,
+}
 
 interface WavSummary {
   bytes: number
@@ -18,6 +25,7 @@ declare global {
     strudelFeature: {
       analyze(): Promise<{ cps: number; cycleDuration: number; minLoopCycles: number }>
       renderPreview(): Promise<WavSummary>
+      renderManualPreview(): Promise<WavSummary>
       exportWav(): Promise<{ summary: WavSummary; bytes: number[]; saveCalls: number }>
     }
   }
@@ -90,7 +98,23 @@ window.strudelFeature = {
 
   async renderPreview() {
     const code = await loadFixture()
-    const url = await renderToUrl(code, 1)
+    const url = await renderToUrl(code, 1, automaticSettings)
+    try {
+      const wav = await fetch(url).then((response) => response.arrayBuffer())
+      return summarizeWav(wav)
+    } finally {
+      URL.revokeObjectURL(url)
+    }
+  },
+
+  async renderManualPreview() {
+    const code = await loadFixture()
+    const url = await renderToUrl(code, 1, {
+      startCycle: 2,
+      endCycle: 3,
+      sampleRate: 48000,
+      maxPolyphony: 16,
+    })
     try {
       const wav = await fetch(url).then((response) => response.arrayBuffer())
       return summarizeWav(wav)
@@ -103,7 +127,7 @@ window.strudelFeature = {
     savedBytes = new Uint8Array()
     saveCalls = 0
     const code = await loadFixture()
-    await exportToWav(code, 1, 'forest')
+    await exportToWav(code, 1, 'forest', automaticSettings)
     const buffer = savedBytes.buffer.slice(
       savedBytes.byteOffset,
       savedBytes.byteOffset + savedBytes.byteLength,

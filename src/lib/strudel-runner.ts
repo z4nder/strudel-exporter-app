@@ -8,9 +8,35 @@ import type { StrudelMeta } from './loop-parser'
 let initialized = false
 let _repl: ReturnType<typeof webaudioRepl> | null = null
 let cachedComposition: { code: string; pattern: any; meta: StrudelMeta } | null = null
-let cachedBaseWav: { code: string; blob: Blob } | null = null
+let cachedBaseWav: { key: string; blob: Blob } | null = null
 
 export type RenderProgress = (progress: number, label: string) => void
+
+export interface RenderSettings {
+  startCycle: number
+  endCycle: number
+  sampleRate: 44100 | 48000 | 96000
+  maxPolyphony: number
+}
+
+function validateRenderSettings(settings: RenderSettings): RenderSettings {
+  const startCycle = Number(settings.startCycle)
+  const endCycle = Number(settings.endCycle)
+  const maxPolyphony = Math.round(Number(settings.maxPolyphony))
+  if (!Number.isFinite(startCycle) || startCycle < 0) {
+    throw new Error('Start cycle deve ser maior ou igual a 0')
+  }
+  if (!Number.isFinite(endCycle) || endCycle <= startCycle) {
+    throw new Error('End cycle deve ser maior que Start cycle')
+  }
+  if (![44100, 48000, 96000].includes(settings.sampleRate)) {
+    throw new Error('Sample rate deve ser 44100, 48000 ou 96000 Hz')
+  }
+  if (maxPolyphony < 1 || maxPolyphony > 256) {
+    throw new Error('Maximum polyphony deve estar entre 1 e 256')
+  }
+  return { ...settings, startCycle, endCycle, maxPolyphony }
+}
 
 function throwIfAborted(signal?: AbortSignal) {
   if (signal?.aborted) throw new DOMException('Geração cancelada', 'AbortError')
@@ -236,11 +262,12 @@ export async function analyzeStrudel(code: string): Promise<StrudelMeta> {
 export async function renderToUrl(
   code: string,
   loops: number,
+  settings: RenderSettings,
   onProgress?: RenderProgress,
   signal?: AbortSignal,
 ): Promise<string> {
   console.log('[strudel] renderToUrl start — loops:', loops)
-  const blob = await renderBaseLoopToWavBlob(code, onProgress, signal)
+  const blob = await renderBaseLoopToWavBlob(code, settings, onProgress, signal)
   throwIfAborted(signal)
   const url = URL.createObjectURL(blob)
   onProgress?.(1, 'Preview pronto')
@@ -251,33 +278,36 @@ export async function renderToUrl(
 /** Uses Strudel for evaluation, event scheduling, samples, effects and rendering. */
 async function renderBaseLoopToWavBlob(
   code: string,
+  rawSettings: RenderSettings,
   onProgress?: RenderProgress,
   signal?: AbortSignal,
 ): Promise<Blob> {
   throwIfAborted(signal)
-  if (cachedBaseWav?.code === code) {
-    onProgress?.(0.94, 'Round completo reutilizado do cache')
+  const settings = validateRenderSettings(rawSettings)
+  const cacheKey = JSON.stringify({ code, ...settings })
+  if (cachedBaseWav?.key === cacheKey) {
+    onProgress?.(0.94, 'Intervalo reutilizado do cache')
     return cachedBaseWav.blob
   }
 
   onProgress?.(0.03, 'Analisando composição…')
   const { pattern, meta } = await evaluateComposition(code)
   throwIfAborted(signal)
-  const endCycle = meta.minLoopCycles
-  onProgress?.(0.1, `Preparando 1 round completo (${endCycle} cycles)…`)
-  console.log('[strudel] got pattern, rendering official Strudel events (begin=0, end=', endCycle, ')')
+  const { startCycle, endCycle, sampleRate, maxPolyphony } = settings
+  const cycleCount = endCycle - startCycle
+  onProgress?.(0.1, `Preparando intervalo ${startCycle} → ${endCycle} (${cycleCount} cycles)…`)
+  console.log('[strudel] got pattern, rendering official Strudel events (begin=', startCycle, 'end=', endCycle, ')')
 
-  const sampleRate = 44100
   const previousContext = strudelWebaudio.getAudioContext()
   await previousContext.close()
-  const offlineContext = new OfflineAudioContext(2, (endCycle / meta.cps) * sampleRate, sampleRate)
+  const offlineContext = new OfflineAudioContext(2, Math.ceil((cycleCount / meta.cps) * sampleRate), sampleRate)
   strudelWebaudio.setAudioContext(offlineContext)
   strudelWebaudio.setSuperdoughAudioController(null)
 
   try {
-    await strudelWebaudio.initAudio({ maxPolyphony: 32, multiChannelOrbits: false })
+    await strudelWebaudio.initAudio({ maxPolyphony, multiChannelOrbits: false })
     const events = pattern
-      .queryArc(0, endCycle, { _cps: meta.cps })
+      .queryArc(startCycle, endCycle, { _cps: meta.cps })
       .sort((a: any, b: any) => a.whole.begin.valueOf() - b.whole.begin.valueOf())
 
     const onsets = events.filter((event: any) => event.hasOnset())
@@ -288,10 +318,10 @@ async function renderBaseLoopToWavBlob(
       event.ensureObjectValue()
       await strudelWebaudio.superdough(
         event.value,
-        event.whole.begin.valueOf() / meta.cps,
+        (event.whole.begin.valueOf() - startCycle) / meta.cps,
         event.duration / meta.cps,
         meta.cps,
-        event.whole.begin.valueOf() / meta.cps,
+        (event.whole.begin.valueOf() - startCycle) / meta.cps,
       )
       onProgress?.(
         0.12 + (0.68 * (index + 1)) / Math.max(onsets.length, 1),
@@ -306,7 +336,7 @@ async function renderBaseLoopToWavBlob(
     const wavBytes = audioBufferToWav(renderedBuffer)
     throwIfAborted(signal)
     const wavBlob = new Blob([wavBytes], { type: 'audio/wav' })
-    cachedBaseWav = { code, blob: wavBlob }
+    cachedBaseWav = { key: cacheKey, blob: wavBlob }
     console.log('[strudel] offline render done — bytes:', wavBlob.size)
     return wavBlob
   } finally {
@@ -359,11 +389,12 @@ export async function exportToWav(
   code: string,
   loops: number,
   name: string,
+  settings: RenderSettings,
   onProgress?: RenderProgress,
   signal?: AbortSignal,
 ): Promise<void> {
   console.log('[strudel] exportToWav start — loops:', loops, 'name:', name)
-  const blob = await renderBaseLoopToWavBlob(code, onProgress, signal)
+  const blob = await renderBaseLoopToWavBlob(code, settings, onProgress, signal)
   throwIfAborted(signal)
   const { save } = await import('@tauri-apps/plugin-dialog')
   const fileName = name.toLowerCase().endsWith('.wav') ? name : `${name}.wav`

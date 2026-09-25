@@ -8,9 +8,13 @@ O cenário verifica em sequência:
 - `analyzeStrudel()` identifica `0.5 cps` e o período completo de 8 cycles;
 - `renderToUrl()` transforma um round completo em uma URL de preview WAV válida;
 - `exportToWav()` reutiliza esse WAV-base e envia ao Rust a base e a quantidade de loops.
+- um intervalo manual `2 → 3` gera exatamente 2 segundos em 48 kHz para a
+  composição de `0.5 cps`.
 
 O Strudel nunca renderiza novamente a composição inteira para cada repetição.
 Ele sintetiza somente `minLoopCycles` uma vez e mantém esse WAV-base em cache.
+O cache inclui código, Start/End cycle, sample rate e maximum polyphony; uma
+configuração nunca reutiliza o áudio produzido por outra.
 O player repete a base durante o preview; no export, o Rust grava o bloco PCM
 sequencialmente e atualiza os tamanhos `RIFF` e `data`, sem FFmpeg e sem
 recompressão.
@@ -55,6 +59,7 @@ O teste falha se qualquer uma destas condições não for atendida:
 - o arquivo não tiver cabeçalhos `RIFF`, `WAVE`, `fmt ` e `data`;
 - o WAV não for PCM estéreo em 44.1 kHz;
 - a duração de um loop completo não estiver próxima de 16 segundos;
+- o intervalo manual `2 → 3` não resultar em 2 segundos a 48 kHz;
 - o áudio estiver silencioso;
 - o motor Web Audio reportar sample ausente ou nós de contextos diferentes.
 

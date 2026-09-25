@@ -1,7 +1,7 @@
 <script lang="ts">
   import { open } from '@tauri-apps/plugin-dialog'
-  import { calcDuration, formatDuration, type StrudelMeta } from './lib/loop-parser'
-  import { analyzeStrudel, renderToUrl, exportToWav } from './lib/strudel-runner'
+  import { formatDuration, type StrudelMeta } from './lib/loop-parser'
+  import { analyzeStrudel, renderToUrl, exportToWav, type RenderSettings } from './lib/strudel-runner'
 
   type AppStatus = 'idle' | 'analyzing' | 'rendering_preview' | 'rendering_export' | 'error'
 
@@ -9,6 +9,11 @@
   let fileContent = $state('')
   let trackName = $state('track')
   let loops = $state(1)
+  let startCycle = $state(0)
+  let endCycle = $state(1)
+  let sampleRate = $state<RenderSettings['sampleRate']>(44100)
+  let maxPolyphony = $state(32)
+  let automaticRange = $state(true)
   let appStatus = $state<AppStatus>('idle')
   let errorMsg = $state('')
   let isDragging = $state(false)
@@ -28,7 +33,7 @@
   let previewIteration = $state(0)
   let previewLoops = $state(1)
   let hasFile = $derived(fileContent.length > 0)
-  let duration = $derived(meta ? calcDuration(meta, loops) : 0)
+  let duration = $derived(meta ? ((endCycle - startCycle) / meta.cps) * loops : 0)
   let isBusy = $derived(appStatus === 'analyzing' || appStatus === 'rendering_preview' || appStatus === 'rendering_export')
   let isRendering = $derived(appStatus === 'rendering_preview' || appStatus === 'rendering_export')
   let hasPreview = $derived(previewUrl.length > 0)
@@ -51,6 +56,7 @@
       fileContent = await invoke<string>('read_strudel_file', { path })
       appStatus = 'analyzing'
       meta = await analyzeStrudel(fileContent)
+      useDetectedRange(false)
       appStatus = 'idle'
       errorMsg = ''
       clearPreview()
@@ -97,6 +103,11 @@
     fileContent = ''
     trackName = 'track'
     loops = 1
+    startCycle = 0
+    endCycle = 1
+    sampleRate = 44100
+    maxPolyphony = 32
+    automaticRange = true
     meta = null
     appStatus = 'idle'
     errorMsg = ''
@@ -124,6 +135,33 @@
     trackName = trackName.trim().replace(/\.wav$/i, '') || 'track'
   }
 
+  function normalizeRenderSettings(manual = true) {
+    startCycle = Math.max(0, Number(startCycle) || 0)
+    endCycle = Math.max(startCycle + 0.25, Number(endCycle) || startCycle + 1)
+    maxPolyphony = Math.min(256, Math.max(1, Math.round(Number(maxPolyphony) || 32)))
+    if (manual) automaticRange = false
+  }
+
+  function changeRenderSettings(manualRange = false) {
+    normalizeRenderSettings(manualRange)
+    onAudioSettingChange()
+  }
+
+  function useDetectedRange(clear = true) {
+    startCycle = 0
+    endCycle = meta?.minLoopCycles ?? 1
+    automaticRange = true
+    if (clear && hasPreview) clearPreview()
+  }
+
+  function onAudioSettingChange() {
+    if (hasPreview) clearPreview()
+  }
+
+  function currentRenderSettings(): RenderSettings {
+    return { startCycle, endCycle, sampleRate, maxPolyphony }
+  }
+
   function cancelGeneration() {
     if (!renderController || cancelRequested) return
     cancelRequested = true
@@ -134,6 +172,7 @@
   async function generatePreview() {
     if (!meta || !fileContent || isBusy) return
     normalizeLoops()
+    normalizeRenderSettings(false)
     clearPreview()
     previewLoops = loops
     renderProgress = 0
@@ -146,6 +185,7 @@
       const url = await renderToUrl(
         fileContent,
         loops,
+        currentRenderSettings(),
         (progress, label) => {
           if (!controller.signal.aborted) updateProgress(progress, label)
         },
@@ -170,6 +210,7 @@
   async function doExport() {
     if (!meta || !fileContent || isBusy) return
     normalizeLoops()
+    normalizeRenderSettings(false)
     normalizeTrackName()
     // Stop preview playback before creating a new offline AudioContext.
     if (audioEl) audioEl.pause()
@@ -184,6 +225,7 @@
         fileContent,
         loops,
         trackName,
+        currentRenderSettings(),
         (progress, label) => {
           if (!controller.signal.aborted) updateProgress(progress, label)
         },
@@ -347,6 +389,79 @@
         <span id="filename-suffix">.wav</span>
       </div>
 
+      <details class="advanced-settings">
+        <summary>
+          <span>Configurações avançadas</span>
+          <span class:manual={!automaticRange} class="range-mode">
+            {automaticRange ? 'intervalo automático' : 'intervalo manual'}
+          </span>
+        </summary>
+        <div class="advanced-content">
+          <div class="advanced-grid">
+            <label>
+              <span>Start cycle</span>
+              <input
+                type="number"
+                min="0"
+                step="0.25"
+                bind:value={startCycle}
+                disabled={isBusy}
+                onchange={() => changeRenderSettings(true)}
+                onblur={() => changeRenderSettings(true)}
+              />
+            </label>
+            <label>
+              <span>End cycle</span>
+              <input
+                type="number"
+                min={startCycle + 0.25}
+                step="0.25"
+                bind:value={endCycle}
+                disabled={isBusy}
+                onchange={() => changeRenderSettings(true)}
+                onblur={() => changeRenderSettings(true)}
+              />
+            </label>
+            <label>
+              <span>Sample rate</span>
+              <select bind:value={sampleRate} disabled={isBusy} onchange={() => changeRenderSettings()}>
+                <option value={44100}>44.100 Hz</option>
+                <option value={48000}>48.000 Hz</option>
+                <option value={96000}>96.000 Hz</option>
+              </select>
+            </label>
+            <label>
+              <span>Maximum polyphony</span>
+              <input
+                type="number"
+                min="1"
+                max="256"
+                step="1"
+                bind:value={maxPolyphony}
+                disabled={isBusy}
+                onchange={() => changeRenderSettings()}
+                onblur={() => changeRenderSettings()}
+              />
+            </label>
+          </div>
+          <div class="detected-range">
+            <span>
+              Round detectado: <strong>0 → {meta?.minLoopCycles ?? 1}</strong>
+            </span>
+            <button
+              type="button"
+              onclick={() => useDetectedRange()}
+              disabled={isBusy}
+            >
+              Restaurar automático
+            </button>
+          </div>
+          <p class="advanced-help">
+            Alterar Start ou End substitui o round detectado. Os loops repetem exatamente esse intervalo.
+          </p>
+        </div>
+      </details>
+
       <label class="loops-label" for="loops-range">
         Loops para preview e export
         <input
@@ -376,6 +491,9 @@
         <span class="duration-sep">·</span>
         Preview: <strong>{formatDuration(duration)}</strong>
         <span class="loops-hint">({loops} {loops === 1 ? 'loop' : 'loops'})</span>
+      </div>
+      <div class="render-summary">
+        Cycles {startCycle} → {endCycle} · {(sampleRate / 1000).toFixed(1)} kHz · {maxPolyphony} vozes
       </div>
 
       <div class="action-row">
@@ -606,6 +724,68 @@
   }
   .filename-input:has(input:disabled) { opacity: 0.55; }
 
+  .advanced-settings {
+    background: #11111c; border: 1px solid #1e1e2c; border-radius: 8px;
+  }
+  .advanced-settings summary {
+    display: flex; align-items: center; justify-content: space-between; gap: 12px;
+    padding: 11px 13px; cursor: pointer; list-style: none;
+    color: #77778e; font-size: 13px; user-select: none;
+  }
+  .advanced-settings summary::-webkit-details-marker { display: none; }
+  .advanced-settings summary::before {
+    content: '›'; color: #c8861e; font-size: 18px; line-height: 1;
+    transition: transform 140ms ease;
+  }
+  .advanced-settings[open] summary::before { transform: rotate(90deg); }
+  .advanced-settings summary > :first-child { margin-right: auto; }
+  .range-mode {
+    padding: 3px 7px; border-radius: 999px;
+    background: rgba(90, 150, 105, 0.12); color: #6d9d77;
+    font: 10px 'JetBrains Mono', monospace;
+  }
+  .range-mode.manual { background: rgba(200, 134, 30, 0.12); color: #c8861e; }
+  .advanced-content {
+    display: flex; flex-direction: column; gap: 12px;
+    padding: 4px 13px 13px; border-top: 1px solid #1b1b29;
+  }
+  .advanced-grid {
+    display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 10px;
+    padding-top: 12px;
+  }
+  .advanced-grid label { display: flex; flex-direction: column; gap: 6px; }
+  .advanced-grid label span { color: #50506a; font-size: 11px; }
+  .advanced-grid input, .advanced-grid select {
+    width: 100%; height: 36px; padding: 8px 10px;
+    background: #171724; color: #d5d1c9; border: 1px solid #272738; border-radius: 6px;
+    outline: none; font: 12px 'JetBrains Mono', monospace;
+  }
+  .advanced-grid select {
+    appearance: none; color-scheme: dark; padding-right: 32px;
+    background-color: #171724;
+    background-image:
+      linear-gradient(45deg, transparent 50%, #8b7653 50%),
+      linear-gradient(135deg, #8b7653 50%, transparent 50%);
+    background-position:
+      calc(100% - 15px) 15px,
+      calc(100% - 10px) 15px;
+    background-size: 5px 5px, 5px 5px;
+    background-repeat: no-repeat;
+  }
+  .advanced-grid select option { background: #171724; color: #d5d1c9; }
+  .advanced-grid input:focus, .advanced-grid select:focus { border-color: #c8861e; }
+  .advanced-grid input:disabled, .advanced-grid select:disabled { opacity: 0.5; cursor: not-allowed; }
+  .detected-range { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
+  .detected-range span { color: #4d4d63; font-size: 11px; }
+  .detected-range strong { color: #85859a; font-family: 'JetBrains Mono', monospace; }
+  .detected-range button {
+    padding: 5px 8px; background: transparent; color: #8b7653;
+    border: 1px solid #443a2c; border-radius: 5px; cursor: pointer; font-size: 11px;
+  }
+  .detected-range button:hover:not(:disabled) { border-color: #c8861e; color: #c8861e; }
+  .detected-range button:disabled { opacity: 0.35; cursor: not-allowed; }
+  .advanced-help { color: #3d3d50; font-size: 11px; line-height: 1.45; }
+
   .loops-label {
     display: flex; align-items: center; justify-content: space-between;
     font-size: 13px; color: #50506a; font-weight: 500;
@@ -633,6 +813,7 @@
   .duration-display strong { color: #e0dcd4; font-weight: 500; }
   .duration-sep { color: #2a2a3a; }
   .loops-hint { font-size: 12px; color: #38384a; }
+  .render-summary { color: #38384a; font: 11px 'JetBrains Mono', monospace; }
 
   /* ── Action buttons ── */
   .action-row { display: flex; gap: 10px; }

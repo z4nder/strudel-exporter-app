@@ -46,13 +46,13 @@ function captureProcessLog(page: Page): string[] {
   return audioErrors
 }
 
-function expectValidWav(wav: WavSummary, expectedDuration: number) {
+function expectValidWav(wav: WavSummary, expectedDuration: number, expectedSampleRate = 44_100) {
   expect(wav.riff).toBe('RIFF')
   expect(wav.wave).toBe('WAVE')
   expect(wav.format).toBe('fmt ')
   expect(wav.data).toBe('data')
   expect(wav.channels).toBe(2)
-  expect(wav.sampleRate).toBe(44_100)
+  expect(wav.sampleRate).toBe(expectedSampleRate)
   expect(wav.durationSeconds).toBeGreaterThan(expectedDuration - 0.05)
   expect(wav.durationSeconds).toBeLessThan(expectedDuration + 0.05)
   expect(wav.bytes).toBeGreaterThan(44_100)
@@ -83,6 +83,13 @@ test('analisa forest.strudel e gera preview/export da composição completa', as
 
   expect(result.saveCalls).toBe(1)
   expectValidWav(result.summary, 16)
+
+  const manualWav = await page.evaluate(() => window.strudelFeature.renderManualPreview())
+  expectValidWav(manualWav, 2, 48_000)
+  await log(
+    `PASS manual range=2..3 sampleRate=${manualWav.sampleRate} duration=${manualWav.durationSeconds.toFixed(3)}s`,
+  )
+
   expect(audioErrors).toEqual([])
   await log(
     `PASS export path=${outputPath} bytes=${result.summary.bytes} duration=${result.summary.durationSeconds.toFixed(3)}s peak=${result.summary.peakSample}`,
