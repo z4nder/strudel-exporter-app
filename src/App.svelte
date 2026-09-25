@@ -15,6 +15,8 @@
   let meta = $state<StrudelMeta | null>(null)
   let renderProgress = $state(0)
   let progressLabel = $state('')
+  let renderController = $state<AbortController | null>(null)
+  let cancelRequested = $state(false)
 
   // preview
   let previewUrl = $state('')
@@ -83,6 +85,7 @@
   }
 
   function reset() {
+    renderController?.abort()
     clearPreview()
     filePath = ''
     fileContent = ''
@@ -93,6 +96,8 @@
     errorMsg = ''
     renderProgress = 0
     progressLabel = ''
+    renderController = null
+    cancelRequested = false
   }
 
   function updateProgress(progress: number, label: string) {
@@ -104,35 +109,86 @@
     loops = Math.min(999, Math.max(1, Math.round(Number(loops) || 1)))
   }
 
+  function normalizeTrackName() {
+    trackName = trackName.trim().replace(/\.wav$/i, '') || 'track'
+  }
+
+  function cancelGeneration() {
+    if (!renderController || cancelRequested) return
+    cancelRequested = true
+    progressLabel = 'Cancelando geração…'
+    renderController.abort()
+  }
+
   async function generatePreview() {
     if (!meta || !fileContent || isBusy) return
+    normalizeLoops()
     clearPreview()
     renderProgress = 0
     progressLabel = 'Iniciando preview…'
+    cancelRequested = false
+    const controller = new AbortController()
+    renderController = controller
     appStatus = 'rendering_preview'
     try {
-      const url = await renderToUrl(fileContent, loops, updateProgress)
+      const url = await renderToUrl(
+        fileContent,
+        loops,
+        (progress, label) => {
+          if (!controller.signal.aborted) updateProgress(progress, label)
+        },
+        controller.signal,
+      )
       previewUrl = url
       appStatus = 'idle'
     } catch (err) {
-      appStatus = 'error'
-      errorMsg = `Erro no preview: ${err}`
+      if (controller.signal.aborted) {
+        appStatus = 'idle'
+        progressLabel = 'Preview cancelado'
+      } else {
+        appStatus = 'error'
+        errorMsg = `Erro no preview: ${err}`
+      }
+    } finally {
+      if (renderController === controller) renderController = null
+      cancelRequested = false
     }
   }
 
   async function doExport() {
     if (!meta || !fileContent || isBusy) return
+    normalizeLoops()
+    normalizeTrackName()
     // Stop preview playback before creating a new offline AudioContext.
     if (audioEl) audioEl.pause()
     renderProgress = 0
     progressLabel = 'Iniciando exportação…'
+    cancelRequested = false
+    const controller = new AbortController()
+    renderController = controller
     appStatus = 'rendering_export'
     try {
-      await exportToWav(fileContent, loops, trackName, updateProgress)
+      await exportToWav(
+        fileContent,
+        loops,
+        trackName,
+        (progress, label) => {
+          if (!controller.signal.aborted) updateProgress(progress, label)
+        },
+        controller.signal,
+      )
       appStatus = 'idle'
     } catch (err) {
-      appStatus = 'error'
-      errorMsg = `Erro ao exportar: ${err}`
+      if (controller.signal.aborted) {
+        appStatus = 'idle'
+        progressLabel = 'Exportação cancelada'
+      } else {
+        appStatus = 'error'
+        errorMsg = `Erro ao exportar: ${err}`
+      }
+    } finally {
+      if (renderController === controller) renderController = null
+      cancelRequested = false
     }
   }
 
@@ -222,7 +278,7 @@
           <path d="M6 8h8M6 11h6M6 14h4" stroke="currentColor" stroke-width="1.2" stroke-linecap="round" opacity=".5"/>
         </svg>
         <span class="file-name">{filePath.split('/').pop()}</span>
-        <button class="close-btn" onclick={reset} aria-label="Remover arquivo">×</button>
+        <button class="close-btn" onclick={reset} aria-label="Remover arquivo" disabled={isBusy}>×</button>
       </div>
       {#if meta}
         <div class="file-meta">
@@ -245,11 +301,43 @@
     </div>
 
     <section class="controls">
+      <label class="field-label" for="track-name">Nome do arquivo</label>
+      <div class="filename-input">
+        <input
+          id="track-name"
+          type="text"
+          bind:value={trackName}
+          maxlength="180"
+          disabled={isBusy}
+          onblur={normalizeTrackName}
+          aria-describedby="filename-suffix"
+        />
+        <span id="filename-suffix">.wav</span>
+      </div>
+
       <label class="loops-label" for="loops-range">
-        Loops para exportar
-        <input class="loops-number" type="number" min="1" max="64" bind:value={loops} />
+        Loops para preview e export
+        <input
+          class="loops-number"
+          type="number"
+          min="1"
+          max="999"
+          bind:value={loops}
+          disabled={isBusy}
+          onchange={normalizeLoops}
+          onblur={normalizeLoops}
+        />
       </label>
-      <input id="loops-range" class="loops-slider" type="range" min="1" max="32" bind:value={loops} />
+      <input
+        id="loops-range"
+        class="loops-slider"
+        type="range"
+        min="1"
+        max="999"
+        bind:value={loops}
+        disabled={isBusy}
+        onchange={normalizeLoops}
+      />
 
       <div class="duration-display">
         Exportar: <strong>{formatDuration(duration)}</strong>
@@ -286,6 +374,28 @@
           {/if}
         </button>
       </div>
+
+      {#if isRendering}
+        <div class="render-progress">
+          <div class="progress-copy">
+            <span>{progressLabel}</span>
+            <span>{Math.round(renderProgress * 100)}%</span>
+          </div>
+          <div
+            class="progress-track"
+            role="progressbar"
+            aria-label={appStatus === 'rendering_preview' ? 'Geração do preview' : 'Exportação do WAV'}
+            aria-valuemin="0"
+            aria-valuemax="100"
+            aria-valuenow={Math.round(renderProgress * 100)}
+          >
+            <div class="progress-fill" style={`width: ${Math.round(renderProgress * 100)}%`}></div>
+          </div>
+          <button class="btn-cancel" type="button" onclick={cancelGeneration} disabled={cancelRequested}>
+            {cancelRequested ? 'Cancelando…' : 'Cancelar geração'}
+          </button>
+        </div>
+      {/if}
 
       {#if hasPreview}
         <div class="player">
@@ -357,6 +467,7 @@
     flex-direction: column;
     padding: 28px 40px 32px;
     gap: 20px;
+    overflow-y: auto;
   }
 
   header {
@@ -430,6 +541,7 @@
     transition: color 140ms;
   }
   .close-btn:hover { color: #c85050; }
+  .close-btn:disabled { opacity: 0.35; cursor: not-allowed; }
   .file-meta { display: flex; align-items: center; gap: 10px; }
   .meta-chip { display: flex; align-items: baseline; gap: 5px; }
   .meta-val { font-family: 'JetBrains Mono', monospace; font-size: 14px; font-weight: 500; color: #c8861e; }
@@ -439,6 +551,28 @@
   /* ── Controls ── */
   .controls { display: flex; flex-direction: column; gap: 14px; }
 
+  .field-label {
+    font-size: 13px; color: #50506a; font-weight: 500;
+  }
+  .filename-input {
+    display: flex; align-items: stretch;
+    background: #131320; border: 1px solid #1e1e2c; border-radius: 8px;
+    overflow: hidden; transition: border-color 140ms;
+  }
+  .filename-input:focus-within { border-color: #c8861e; }
+  .filename-input input {
+    min-width: 0; flex: 1; padding: 10px 12px;
+    background: transparent; border: 0; outline: none;
+    color: #e0dcd4; font-family: 'JetBrains Mono', monospace; font-size: 13px;
+  }
+  .filename-input span {
+    display: flex; align-items: center; padding: 0 13px;
+    background: #1a1a28; border-left: 1px solid #29293a;
+    color: #c8861e; font-family: 'JetBrains Mono', monospace; font-size: 13px;
+    user-select: none;
+  }
+  .filename-input:has(input:disabled) { opacity: 0.55; }
+
   .loops-label {
     display: flex; align-items: center; justify-content: space-between;
     font-size: 13px; color: #50506a; font-weight: 500;
@@ -446,10 +580,11 @@
   .loops-number {
     background: #131320; border: 1px solid #1e1e2c; border-radius: 6px;
     color: #e0dcd4; font-family: 'JetBrains Mono', monospace;
-    font-size: 13px; padding: 4px 10px; width: 64px; text-align: center;
+    font-size: 15px; padding: 7px 12px; width: 96px; text-align: center;
     outline: none; transition: border-color 140ms;
   }
   .loops-number:focus { border-color: #c8861e; }
+  .loops-number:disabled, .loops-slider:disabled { opacity: 0.45; cursor: not-allowed; }
   .loops-slider {
     width: 100%; appearance: none; height: 3px;
     background: #1e1e2c; border-radius: 2px; outline: none; cursor: pointer;
@@ -492,6 +627,31 @@
   }
   .btn-export:hover:not(:disabled) { background: #d9971f; }
   .btn-export:disabled { opacity: 0.55; cursor: not-allowed; }
+
+  /* ── Render progress ── */
+  .render-progress {
+    display: grid; grid-template-columns: 1fr auto; gap: 9px 14px; align-items: center;
+    padding: 12px 14px; background: #131320;
+    border: 1px solid #242435; border-radius: 8px;
+  }
+  .progress-copy {
+    grid-column: 1 / -1; display: flex; justify-content: space-between; gap: 16px;
+    color: #77778e; font-size: 12px; font-family: 'JetBrains Mono', monospace;
+  }
+  .progress-track {
+    height: 6px; overflow: hidden; background: #272738; border-radius: 999px;
+  }
+  .progress-fill {
+    height: 100%; background: #c8861e; border-radius: inherit;
+    transition: width 120ms ease;
+  }
+  .btn-cancel {
+    padding: 6px 10px; white-space: nowrap;
+    background: transparent; color: #c86b62; border: 1px solid #613a3a; border-radius: 6px;
+    font: 500 12px 'Space Grotesk', sans-serif; cursor: pointer;
+  }
+  .btn-cancel:hover:not(:disabled) { background: rgba(200, 80, 80, 0.1); }
+  .btn-cancel:disabled { opacity: 0.45; cursor: wait; }
 
   /* ── Spinner ── */
   .spinner {

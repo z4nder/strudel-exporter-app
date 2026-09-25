@@ -11,6 +11,10 @@ let cachedComposition: { code: string; pattern: any; meta: StrudelMeta } | null 
 
 export type RenderProgress = (progress: number, label: string) => void
 
+function throwIfAborted(signal?: AbortSignal) {
+  if (signal?.aborted) throw new DOMException('Geração cancelada', 'AbortError')
+}
+
 async function ensureInit() {
   if (initialized) return
   console.log('[strudel] ensureInit: setting up official Strudel modules...')
@@ -232,9 +236,11 @@ export async function renderToUrl(
   code: string,
   loops: number,
   onProgress?: RenderProgress,
+  signal?: AbortSignal,
 ): Promise<string> {
   console.log('[strudel] renderToUrl start — loops:', loops)
-  const blob = await renderToWavBlob(code, loops, onProgress)
+  const blob = await renderToWavBlob(code, loops, onProgress, signal)
+  throwIfAborted(signal)
   const url = URL.createObjectURL(blob)
   onProgress?.(1, 'Preview pronto')
   console.log('[strudel] preview URL created — bytes:', blob.size)
@@ -246,9 +252,12 @@ async function renderToWavBlob(
   code: string,
   loops: number,
   onProgress?: RenderProgress,
+  signal?: AbortSignal,
 ): Promise<Blob> {
+  throwIfAborted(signal)
   onProgress?.(0.03, 'Analisando composição…')
   const { pattern, meta } = await evaluateComposition(code)
+  throwIfAborted(signal)
   const endCycle = meta.minLoopCycles * loops
   onProgress?.(0.1, `Preparando ${endCycle} cycles…`)
   console.log('[strudel] got pattern, rendering official Strudel events (begin=0, end=', endCycle, ')')
@@ -269,6 +278,7 @@ async function renderToWavBlob(
     const onsets = events.filter((event: any) => event.hasOnset())
     console.log('[strudel] scheduling onsets:', onsets.length)
     for (let index = 0; index < onsets.length; index++) {
+      throwIfAborted(signal)
       const event = onsets[index]
       event.ensureObjectValue()
       await strudelWebaudio.superdough(
@@ -286,8 +296,10 @@ async function renderToWavBlob(
 
     onProgress?.(0.84, 'Renderizando áudio…')
     const renderedBuffer = await offlineContext.startRendering()
+    throwIfAborted(signal)
     onProgress?.(0.94, 'Codificando WAV…')
     const wavBytes = audioBufferToWav(renderedBuffer)
+    throwIfAborted(signal)
     const wavBlob = new Blob([wavBytes], { type: 'audio/wav' })
     console.log('[strudel] offline render done — bytes:', wavBlob.size)
     return wavBlob
@@ -342,9 +354,11 @@ export async function exportToWav(
   loops: number,
   name: string,
   onProgress?: RenderProgress,
+  signal?: AbortSignal,
 ): Promise<void> {
   console.log('[strudel] exportToWav start — loops:', loops, 'name:', name)
-  const blob = await renderToWavBlob(code, loops, onProgress)
+  const blob = await renderToWavBlob(code, loops, onProgress, signal)
+  throwIfAborted(signal)
   const { save } = await import('@tauri-apps/plugin-dialog')
   const fileName = name.toLowerCase().endsWith('.wav') ? name : `${name}.wav`
   onProgress?.(0.96, 'Escolhendo destino…')
@@ -353,16 +367,20 @@ export async function exportToWav(
     filters: [{ name: 'WAV audio', extensions: ['wav'] }],
   })
 
+  throwIfAborted(signal)
+
   if (!path) {
     console.log('[strudel] export cancelled by user')
     return
   }
 
   const bytes = Array.from(new Uint8Array(await blob.arrayBuffer()))
+  throwIfAborted(signal)
   onProgress?.(0.98, 'Salvando arquivo…')
   console.log('[strudel] saving WAV through Tauri — path:', path, 'bytes:', bytes.length)
   const { invoke } = await import('@tauri-apps/api/core')
   await invoke('save_wav_bytes', { path, bytes })
+  throwIfAborted(signal)
   onProgress?.(1, 'Exportação concluída')
   console.log('[strudel] export done — path:', path)
 }
